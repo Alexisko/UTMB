@@ -1,0 +1,782 @@
+---
+title: "Tangi across three UTMBs"
+subtitle: "Where a 2026-calibre run by Tangi Taton would have landed in the 2024 and 2025 editions — and how much of the answer is really knowable."
+author: "Alexis Konarski"
+date: today
+format:
+  html:
+    theme: ft.scss
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    number-sections: false
+    code-fold: false
+    fig-width: 9
+    fig-height: 6
+    fig-dpi: 160
+    embed-resources: true
+    df-print: kable
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+```{r setup}
+#| include: false
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(scales)
+library(ggrepel)
+library(stringr)
+library(knitr)
+library(ggtext)
+library(splines)
+
+source("ft_style.R")
+knitr::opts_chunk$set(dev = "png", dpi = 160, echo = FALSE)
+theme_set(theme_ft())
+
+set.seed(20260907)
+
+spotlight_name <- "Tangi TATON"
+spotlight_bib  <- 535L
+
+ord <- function(n) paste0(n, dplyr::case_when(
+  n %% 100 %in% 11:13 ~ "th", n %% 10 == 1 ~ "st",
+  n %% 10 == 2 ~ "nd", n %% 10 == 3 ~ "rd", .default = "th"))
+fmt_hms <- function(s) {
+  h <- floor(s / 3600); m <- floor((s %% 3600) / 60)
+  sprintf("%d:%02d", h, m)
+}
+mins <- function(h) paste0(round(abs(h) * 60), " min")
+# Every chart in this report reads all three editions.
+srcline <- function(note = NULL) ft_source(note, editions = "2024–2026 editions")
+key <- function(x) toupper(trimws(x))     # join key for runners across editions
+```
+
+```{r load}
+# Full field (finishers + DNFs) for each edition. 2026 is the existing file;
+# 2024 / 2025 are scraped by R/scrape_history.R.
+paths <- c(
+  `2024` = "../data/processed/runners_all_utmb_2024.csv",
+  `2025` = "../data/processed/runners_all_utmb_2025.csv",
+  `2026` = "../data/processed/runners_all_utmb.csv"
+)
+
+# The index range over which the index->time line is well measured in every
+# edition: high enough that few runners are lost to the cut-off, low enough
+# that the sample is not just the elite. See the methodology.
+FIT_LO <- 650; FIT_HI <- 900
+in_range <- function(d) filter(d, utmb_index >= FIT_LO, utmb_index <= FIT_HI)
+
+prep <- function(df) {
+  s <- df |>
+    filter(outcome %in% c("Finisher", "DNF"), !is.na(utmb_index)) |>
+    mutate(time_h = race_time_seconds / 3600,
+           fin    = as.integer(outcome == "Finisher"))
+  f <- s |>
+    filter(outcome == "Finisher", !is.na(race_time_seconds)) |>
+    arrange(race_time_seconds) |>
+    mutate(fin_rank = row_number())
+  list(
+    s = s, f = f,
+    n_start = nrow(s), n_fin = nrow(f), n_dnf = sum(s$outcome == "DNF"),
+    dnf_rate = sum(s$outcome == "DNF") / nrow(s),
+    med_index = median(s$utmb_index),
+    fit      = lm(time_h ~ utmb_index, data = in_range(f)),   # primary
+    fit_full = lm(time_h ~ utmb_index, data = f)              # sensitivity
+  )
+}
+
+ed <- map(paths, \(p) prep(read_csv(p, show_col_types = FALSE)))
+y24 <- ed[["2024"]]; y25 <- ed[["2025"]]; y26 <- ed[["2026"]]
+
+# Seeds. Two bases, and the distinction matters more than anything else here:
+#   seed_start = rank among everyone who STARTED rated above you
+#   seed_fin   = rank among everyone who FINISHED rated above you
+seed_start <- function(Y, I) sum(Y$s$utmb_index > I) + 1L
+seed_fin   <- function(Y, I) sum(Y$f$utmb_index > I) + 1L
+par_time   <- function(Y, I, full = FALSE)
+  as.numeric(predict(if (full) Y$fit_full else Y$fit, data.frame(utmb_index = I)))
+```
+
+```{r baseline}
+TI           <- 758L                                   # his 2026 UTMB Index
+tangi26      <- y26$f |> filter(bib == spotlight_bib)
+tangi_time_s <- tangi26$race_time_seconds
+tangi_time_h <- tangi26$time_h
+tangi_rank26 <- tangi26$fin_rank
+tangi_cat    <- tangi26$category
+
+seedS26 <- seed_start(y26, TI)   # 229th on the start list
+seedF26 <- seed_fin(y26, TI)     # 133rd among those who finished
+
+# Form, measured LIKE FOR LIKE: seed and rank both on the finisher basis.
+formF_delta <- seedF26 - tangi_rank26      # -20
+formF_ratio <- tangi_rank26 / seedF26      # 1.15
+# The mixed-basis version the first draft of this report used, kept only to
+# show why it is wrong.
+formS_delta <- seedS26 - tangi_rank26      # +76, an artefact
+
+# Personal margin against the index->time line (primary = restricted fit).
+pred26  <- par_time(y26, TI)
+resid26 <- tangi_time_h - pred26
+pred26_full  <- par_time(y26, TI, full = TRUE)
+resid26_full <- tangi_time_h - pred26_full
+resid_sd26   <- sd(resid(y26$fit))
+```
+
+```{r form-population}
+# Both versions of "form" for every 2026 finisher, so Tangi can be placed in
+# the distribution rather than judged against zero.
+popform <- y26$f |>
+  mutate(seedS = map_int(utmb_index, \(i) seed_start(y26, i)),
+         seedF = map_int(utmb_index, \(i) seed_fin(y26, i)),
+         dS = seedS - fin_rank, dF = seedF - fin_rank,
+         rhoS = fin_rank / seedS, rhoF = fin_rank / seedF)
+tp <- popform |> filter(bib == spotlight_bib)
+
+pct_dS   <- mean(popform$dS < tp$dS) * 100          # his percentile on the artefact
+pct_dF   <- mean(popform$dF < tp$dF) * 100          # his percentile like-for-like
+med_dS   <- median(popform$dS); med_dF <- median(popform$dF)
+attrition_gain <- tp$dS - tp$dF                     # places purely from DNFs above him
+
+# A2: rank is not bounded by higher-rated finishers.
+ahead26      <- y26$f |> filter(fin_rank < tangi_rank26)
+ahead_weaker <- sum(ahead26$utmb_index <= TI)
+```
+
+```{r drift}
+# Index scale drift, measured within runner on those who ran two editions.
+returnees <- function(yr) {
+  a <- ed[[yr]]$s |> mutate(k = key(fullname)) |> distinct(k, .keep_all = TRUE) |>
+    select(k, i_old = utmb_index)
+  b <- y26$s |> mutate(k = key(fullname)) |> distinct(k, .keep_all = TRUE) |>
+    select(k, i_new = utmb_index)
+  inner_join(a, b, by = "k") |> mutate(d = i_new - i_old)
+}
+ret <- map(c(`2024` = "2024", `2025` = "2025"), returnees)
+drift <- map_dbl(ret, \(m) median(m$d))
+n_ret <- map_int(ret, nrow)
+pct_identical <- map_dbl(ret, \(m) 100 * mean(m$i_old == m$i_new))
+
+# His own contemporaneous rating on UTMB day 2025, supplied outside the API.
+TI_2025_actual <- 732L
+```
+
+```{r uniform-test}
+# Is the year effect a pure level shift? If so the index->time slope should not
+# move between editions. Tested on the fitted range and on the whole field.
+int_p <- function(restrict) {
+  d <- imap(ed, \(Y, yr) (if (restrict) in_range(Y$f) else Y$f) |> mutate(year = yr)) |>
+    list_rbind()
+  anova(lm(time_h ~ utmb_index + year, data = d),
+        lm(time_h ~ utmb_index * year, data = d))[["Pr(>F)"]][2]
+}
+int_p_restricted <- int_p(TRUE)
+int_p_full       <- int_p(FALSE)
+```
+
+```{r projections}
+# Four lenses. A and B are naive bookends; C and D are the working ones.
+project <- function(Y, yr) {
+  sS <- seed_start(Y, TI); sF <- seed_fin(Y, TI)
+  # Drift-adjusted seed: his 2026-scale index expressed on that year's scale.
+  I_adj  <- TI - (if (yr == "2026") 0 else drift[[yr]])
+  sF_adj <- seed_fin(Y, I_adj)
+  predY      <- par_time(Y, TI)
+  predY_full <- par_time(Y, TI, full = TRUE)
+  tibble(
+    year = yr,
+    n_start = Y$n_start, n_fin = Y$n_fin, dnf_rate = Y$dnf_rate,
+    med_index = Y$med_index,
+    seed_start = sS, seed_fin = sF, seed_fin_adj = sF_adj,
+    raw_time = sum(Y$f$race_time_seconds < tangi_time_s) + 1L,      # B
+    adj_delta = pmax(1L, sF - formF_delta),                          # C
+    adj_ratio = pmax(1L, as.integer(round(sF * formF_ratio))),       # C
+    adj_drift = pmax(1L, sF_adj - formF_delta),                      # C, drift-adjusted
+    model      = sum(Y$f$time_h < (predY + resid26)) + 1L,           # D
+    model_full = sum(Y$f$time_h < (predY_full + resid26_full)) + 1L, # D, full-range fit
+    par_h = predY, par_h_full = predY_full, proj_time_h = predY + resid26
+  )
+}
+proj <- imap(ed, \(Y, yr) project(Y, yr)) |> list_rbind()
+
+# The central estimate is the mean of the three working projections
+# (C-delta, C-ratio, D), and the reported range is their spread.
+proj <- proj |>
+  rowwise() |>
+  mutate(central   = round(mean(c_across(c(adj_delta, adj_ratio, model)))),
+         spread_lo = min(c_across(c(adj_delta, adj_ratio, model))),
+         spread_hi = max(c_across(c(adj_delta, adj_ratio, model)))) |>
+  ungroup()
+
+g <- \(yr, col) proj[[col]][proj$year == yr]
+```
+
+```{r uncertainty}
+prior <- proj |> filter(year != "2026")
+b <- \(yr, col) prior[[col]][prior$year == yr]
+
+# What if he had run exactly to his rating instead of his 2026 margin? The
+# cleanest sensitivity to the one thing being transplanted.
+par_rank <- map_int(c(`2024` = "2024", `2025` = "2025"),
+                    \(yr) sum(ed[[yr]]$f$time_h < g(yr, "par_h")) + 1L)
+
+# The widest defensible region per year: the sampling range of the fits, the
+# spread across methods, and the zero-margin scenario, rounded outward to 5.
+# Sampling error in the two fitted lines behind lens D.
+boot_D <- map(c("2024", "2025"), \(yr) {
+  v <- map_int(1:600, \(i) {
+    a <- in_range(slice_sample(y26$f, prop = 1, replace = TRUE))
+    c2 <- in_range(slice_sample(ed[[yr]]$f, prop = 1, replace = TRUE))
+    m26 <- lm(time_h ~ utmb_index, a); my <- lm(time_h ~ utmb_index, c2)
+    e <- tangi_time_h - predict(m26, data.frame(utmb_index = TI))
+    sum(ed[[yr]]$f$time_h < (predict(my, data.frame(utmb_index = TI)) + e)) + 1L
+  })
+  tibble(year = yr, lo = round(quantile(v, .025)), hi = round(quantile(v, .975)))
+}) |> list_rbind()
+bd <- \(yr, col) boot_D[[col]][boot_D$year == yr]
+
+# Rank density around the projection: how many places a 15-minute error is worth.
+dens15 <- map_int(c(`2024` = "2024", `2025` = "2025"),
+                  \(yr) sum(abs(ed[[yr]]$f$time_h - g(yr, "proj_time_h")) < 0.25))
+
+# The widest defensible region per year: the sampling range of the fits, the
+# spread across methods and the zero-margin scenario, rounded outward to 5.
+firm <- function(yr) {
+  v <- c(bd(yr, "lo"), bd(yr, "hi"), b(yr, "spread_lo"), b(yr, "spread_hi"),
+         par_rank[[yr]])
+  c(lo = floor(min(v) / 5) * 5, hi = ceiling(max(v) / 5) * 5)
+}
+gain <- tangi_rank26 - prior$central
+```
+
+# The question
+
+Tangi Taton (bib `r spotlight_bib`, UTMB Index **`r TI`**) finished **UTMB 2026** in
+**`r fmt_hms(tangi_time_s)`**, **`r ord(tangi_rank26)`** of `r comma(y26$n_fin)` finishers
+(category `r tangi_cat`). How would the *same runner, running equally well*, have placed in the
+**2024** and **2025** editions?
+
+Neither finish time nor raw rank answers this: each year a different field turns up on a different
+day. The decisive fact is that **2026 was an unusually deep edition at his level** —
+`r sum(y26$f$utmb_index > TI)` higher-rated runners reached the finish, against
+`r sum(y24$f$utmb_index > TI)` in 2024 and `r sum(y25$f$utmb_index > TI)` in 2025. The same run is
+worth fewer places when more strong runners are in the way, so ranks have to be adjusted for field
+strength before they can be compared across years.
+
+The question is a conditional one: *if he had run the same race relative to his rating*, what would
+that have been worth in a thinner field? "Running equally well" is an assumption imposed here, not a
+prediction — nobody knows what he would actually have done on a different mountain day. What follows
+works that assumption through, and then sets out how much weight it can bear.
+
+# How would he have finished? {#headline}
+
+```{r headline-table}
+prior |>
+  transmute(
+    Edition = year,
+    Finishers = comma(n_fin),
+    `Higher-rated finishers` = seed_fin - 1L,
+    `Projected place` = ord(central),
+    `Across the three methods` = paste0(ord(spread_lo), "–", ord(spread_hi)),
+    `Places gained on his 153rd` = paste0("+", tangi_rank26 - central)
+  ) |>
+  kable(align = "lrrrrr")
+```
+
+The same run puts him around **`r ord(g("2024","central"))` in 2024** and
+**`r ord(g("2025","central"))` in 2025** — roughly `r tangi_rank26 - g("2024","central")` and
+`r tangi_rank26 - g("2025","central")` places ahead of his real `r ord(tangi_rank26)`. Three
+different ways of doing the arithmetic ([set out below](#the-lenses)) land within
+`r max(prior$spread_hi - prior$spread_lo)` places of each other.
+
+That closeness is reassuring about the arithmetic and nothing more. The three methods share one
+input — his single 2026 race — so they cannot disagree about it, and **their spread is not an
+uncertainty interval**. What can be said about precision is [set out further down](#firm); the short
+version is that the place should be read to the nearest ten or twenty, not to the unit.
+`r dens15[["2024"]]` finishers sit within a quarter of an hour of his projected 2024 time and
+`r dens15[["2025"]]` within a quarter of an hour in 2025, so a 15-minute error in the modelling is
+worth a dozen places on its own.
+
+```{r headline-chart}
+#| fig-height: 4.6
+#| fig-cap: "The projected place in each prior edition, against Tangi's real 2026 finish. Further right is better."
+hc <- prior |>
+  left_join(boot_D, by = "year") |>
+  mutate(year = factor(year, levels = c("2025", "2024")))
+
+ggplot(hc, aes(y = year)) +
+  geom_linerange(aes(xmin = lo, xmax = hi), linewidth = 7, colour = ft_paper2) +
+  geom_linerange(aes(xmin = spread_lo, xmax = spread_hi), linewidth = 2.4, colour = ft_neutral) +
+  geom_vline(xintercept = tangi_rank26, colour = ft_ink2, linetype = "22", linewidth = 0.4) +
+  geom_point(aes(x = central), size = 4, colour = ft_blue) +
+  geom_text(aes(x = central, label = ord(central)), vjust = -1.4,
+            family = "Helvetica Neue", colour = ft_ink, size = 3.4) +
+  annotate("text", x = tangi_rank26, y = 2.42, label = "his real 2026 finish  ",
+           hjust = 1, family = "Helvetica Neue", colour = ft_ink2, size = 3.1) +
+  scale_x_reverse(limits = c(max(hc$hi) + 25, 0)) +
+  labs(title = paste0("The same run is worth ", min(gain), "–", max(gain),
+                      " more places in the thinner fields"),
+       subtitle = paste0("Projected place (dot), the spread across the three methods (dark bar) ",
+                         "and the sampling range of the fitted lines (pale bar)."),
+       x = "Projected finishing place (reversed — further right is better)", y = NULL,
+       caption = srcline("Neither bar is a full uncertainty interval — see 'How firm is this?'"))
+```
+
+# What his 2026 run was actually worth {#form}
+
+Before his run can be carried anywhere it has to be valued correctly — and the obvious way of valuing
+it is wrong.
+
+The obvious way is to compare where he was seeded with where he finished. On the 2026 start list a
+`r TI` index put him **`r ord(seedS26)`**; he finished **`r ord(tangi_rank26)`**, apparently
+*beating* his seed by `r formS_delta` places. That comparison is broken, and the way it is broken
+flatters every finisher.
+
+The seed counts everyone rated above him who **started**; the rank counts only those who
+**finished**. `r comma(y26$n_dnf)` runners left the denominator without leaving the numerator, so
+every finisher shows a positive margin by construction. Across all `r comma(nrow(popform))` 2026
+finishers the median "margin" is **`r med_dS` places**; Tangi's `r formS_delta` is only the
+**`r ord(round(pct_dS))` percentile** of it.
+
+Put both sides on the same basis — seed among finishers, rank among finishers — and the margin
+reverses:
+
+```{r form-table}
+tibble(
+  Basis = c("Seed on the start list (mixed basis)", "Seed among finishers (like for like)"),
+  Seed = c(ord(seedS26), ord(seedF26)),
+  Finish = ord(tangi_rank26),
+  Margin = c(paste0("+", formS_delta, " places"), paste0(formF_delta, " places")),
+  `Percentile of the field` = c(paste0(ord(round(pct_dS))), paste0(ord(round(pct_dF))))
+) |> kable(align = "lrrrr")
+```
+
+Of that apparent +`r formS_delta`-place margin, **`r attrition_gain` places came from higher-rated runners
+dropping out ahead of him** — attrition, not racing. On a like-for-like basis he finished
+**`r abs(formF_delta)` places behind his rating** among those who finished, against a field median of
+**+`r med_dF`**. He ran an unremarkable race for his rating: solidly, but not above it.
+
+```{r form-chart}
+#| fig-height: 4.4
+#| fig-cap: "The distribution of the like-for-like margin (seed among finishers minus finishing rank) across all 2026 finishers. Positive = finished ahead of rating."
+ggplot(popform, aes(dF)) +
+  geom_histogram(binwidth = 40, fill = ft_neutral, colour = NA) +
+  geom_vline(xintercept = med_dF, colour = ft_ink2, linetype = "22", linewidth = 0.4) +
+  geom_vline(xintercept = tp$dF, colour = ft_blue, linewidth = 0.8) +
+  annotate("text", x = tp$dF, y = Inf, label = paste0("  Tangi: ", tp$dF),
+           hjust = 0, vjust = 1.6, family = "Helvetica Neue", colour = ft_blue, size = 3.4) +
+  annotate("text", x = med_dF, y = Inf, label = paste0("field median: +", med_dF, "  "),
+           hjust = 1, vjust = 1.6, family = "Helvetica Neue", colour = ft_ink2, size = 3.4) +
+  labs(title = "On a like-for-like basis his 2026 run was an average one for his rating",
+       subtitle = paste0("Places gained on the finisher-basis seed, all ", comma(nrow(popform)),
+                         " finishers carrying an index. He is at the ", ord(round(pct_dF)),
+                         " percentile."),
+       x = "Places gained on seed (finisher basis)", y = "Finishers",
+       caption = srcline())
+```
+
+This does not change the direction of the answer, but it changes what is being carried across the
+years. What gets transplanted below is **an average run for a `r TI` index**, not an outstanding one,
+and the reason he places better in 2024 and 2025 is entirely that the field was thinner — not that he
+had a special day.
+
+# The lenses
+
+Four lenses, from naïve to working. Every projected rank is a rank **among finishers**, and every
+seed is counted **among finishers**, so the two are always on the same basis.
+
+**A · Seed — "on paper".**
+Count the higher-rated runners in each year's field. Among finishers that is
+**`r ord(g("2024","seed_fin"))`** (2024), **`r ord(g("2025","seed_fin"))`** (2025) and
+**`r ord(seedF26)`** (2026). This is expectation, not result, but it is the crux of the question:
+same runner, better starting position, because fewer strong runners were in his way.
+
+**B · Raw time — the naïve answer.**
+Slot `r fmt_hms(tangi_time_s)` straight into each year's finish list:
+`r ord(g("2024","raw_time"))` in 2024, `r ord(g("2025","raw_time"))` in 2025. Distrust it — it
+assumes identical conditions across years, when a typical `r TI`-index finisher needed
+`r mins(g("2024","par_h") - pred26)` longer in 2024 than in 2026. Its swing measures the size of the
+year effect, not a projection.
+
+**C · Seed-adjusted — his rating, plus his form.**
+Carry his measured like-for-like form ($\delta_F = `r formF_delta`$ places, or equivalently
+$\rho_F = `r round(formF_ratio, 2)`\times$ his seed) onto each year's own finisher-basis seed. That
+gives **`r ord(g("2025","adj_delta"))`–`r ord(g("2025","adj_ratio"))` in 2025** and
+**`r ord(g("2024","adj_delta"))`–`r ord(g("2024","adj_ratio"))` in 2024**.
+
+**D · Index-residual time model.**
+Fit each edition's UTMB Index → finish-time line over the well-measured index range
+(`r FIT_LO`–`r FIT_HI`). In 2026 a typical `r TI`-index finisher took **`r fmt_hms(pred26 * 3600)`**;
+Tangi ran **`r mins(resid26)` `r if (resid26 < 0) "faster" else "slower"`**. Holding that margin and
+reading it against each year's own line puts him at **`r ord(g("2025","model"))` in 2025** and
+**`r ord(g("2024","model"))` in 2024**.
+
+C and D are **not independent**. Both are anchored on the same single run and the same index; they
+differ only in whether the anchor is expressed in places or in minutes. Their agreement is
+reassuring about arithmetic, not about the underlying assumption.
+
+```{r lens-table}
+proj |>
+  transmute(
+    Edition = year,
+    `A · seed` = ord(seed_fin),
+    `B · raw time` = ord(raw_time),
+    `C · delta` = ord(adj_delta),
+    `C · ratio` = ord(adj_ratio),
+    `D · time model` = ord(model),
+    `D · full-range fit` = ord(model_full)
+  ) |>
+  kable(align = "lrrrrrr",
+        caption = "Every lens, every edition. The 2026 row is a self-check: C reproduces his actual 153rd by construction, and D lands on it because his residual is measured there.")
+```
+
+```{r model-chart}
+#| fig-cap: "Each edition's UTMB Index → finish-time line, fit over the well-measured index range. The vertical line marks Tangi's index; the points are his projected times once his 2026 margin is carried across."
+grid_idx <- tibble(utmb_index = seq(FIT_LO, FIT_HI, by = 5))
+lines <- imap(ed, \(Y, yr) grid_idx |>
+                mutate(year = yr,
+                       time_h = as.numeric(predict(Y$fit, newdata = grid_idx)))) |>
+  list_rbind()
+pts <- proj |> transmute(year, utmb_index = TI, time_h = proj_time_h)
+
+ggplot(lines, aes(utmb_index, time_h, colour = year)) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(xintercept = TI, colour = ft_ink2, linetype = "22", linewidth = 0.4) +
+  geom_point(data = pts, size = 3.2) +
+  geom_text_repel(data = pts, aes(label = paste0(year, ": ", fmt_hms(time_h * 3600))),
+                  family = "Helvetica Neue", size = 3.3, seg.colour = ft_neutral,
+                  direction = "y", nudge_x = 25, show.legend = FALSE) +
+  scale_colour_manual(values = c(`2024` = ft_claret, `2025` = ft_orange, `2026` = ft_blue),
+                      name = "Edition") +
+  scale_y_continuous(labels = \(h) paste0(h, "h")) +
+  labs(title = "The same index buys a different finish time each year",
+       subtitle = paste0("Index→time fit per edition, index ", FIT_LO, "–", FIT_HI,
+                         ". Points carry his 2026 margin (", mins(resid26), " ",
+                         if (resid26 < 0) "faster" else "slower", " than par) across."),
+       x = "UTMB Index", y = "Finish time",
+       caption = srcline("Higher line = a slower edition at a given index")) +
+  theme(legend.position = "top")
+```
+
+# How firm is this? {#firm}
+
+Four things bound how precisely this can be answered. None of them changes the direction; all of
+them argue against quoting a place to the unit.
+
+**The margin being carried is thin.** Everything rests on one number: that Tangi ran
+`r mins(resid26)` faster than a typical `r TI`-index finisher in 2026. Against a residual spread of
+`r mins(resid_sd26)` around that line, this is a **z of `r round(resid26 / resid_sd26, 2)`** — about
+a fifth of a standard deviation. Measured on a single race, that is close to indistinguishable from
+an ordinary day, so the honest reading is not "he has a `r mins(resid26)` edge" but "he ran roughly
+to his rating, perhaps a shade better". Carry *exactly* his rating instead — set the margin to zero —
+and he lands `r ord(par_rank[["2024"]])` in 2024 and `r ord(par_rank[["2025"]])` in 2025, some
+`r par_rank[["2024"]] - g("2024","model")` and `r par_rank[["2025"]] - g("2025","model")` places
+back. That is the size of the entire personal-margin term.
+
+**The lines themselves are estimates.** Lens D reads his margin against two fitted index→time lines,
+each carrying sampling error of its own. Bootstrapping both fits (600 replicates) puts him at
+`r ord(bd("2024","lo"))`–`r ord(bd("2024","hi"))` in 2024 and
+`r ord(bd("2025","lo"))`–`r ord(bd("2025","hi"))` in 2025 — already several times wider than the
+three methods disagree, and covering only one source of error.
+
+**Places are cheap where he finishes.** `r dens15[["2024"]]` finishers sat within a quarter of an
+hour of his projected 2024 time and `r dens15[["2025"]]` within a quarter of an hour in 2025. Fifteen
+minutes is well inside the noise of any of this, and it is worth a dozen places.
+
+**And he might not have finished at all.** `r percent(g("2024","dnf_rate"), 1)` of 2024 starters and
+`r percent(g("2025","dnf_rate"), 1)` of 2025 starters did not, both above 2026's
+`r percent(g("2026","dnf_rate"), 1)`. Every number here is conditional on him reaching Chamonix.
+
+Read together, the defensible answer is a region rather than a place: **roughly
+`r ord(firm("2024")[["lo"]])`–`r ord(firm("2024")[["hi"]])` in 2024 and
+`r ord(firm("2025")[["lo"]])`–`r ord(firm("2025")[["hi"]])` in 2025**, comfortably ahead of
+`r ord(tangi_rank26)` in both — and the reason is the field rather than the runner.
+
+# Why the years differ: field and attrition {#why}
+
+Two forces decide whether the same run is worth more or fewer places: **how deep the field is at his
+level**, and **how brutal the day is**. Both worked against him in 2026.
+
+```{r depth-table}
+depth <- imap(ed, \(Y, yr) tibble(
+  Edition = yr,
+  `Higher-rated starters` = sum(Y$s$utmb_index > TI),
+  `Higher-rated finishers` = sum(Y$f$utmb_index > TI),
+  `Starters ≥ 800` = sum(Y$s$utmb_index >= 800),
+  `Starters ≥ 850` = sum(Y$s$utmb_index >= 850),
+  `Starters ≥ 900` = sum(Y$s$utmb_index >= 900)
+)) |> list_rbind()
+kable(depth, align = "lrrrrr",
+      caption = "Field depth at and above Tangi's index (758). The first two columns are the same population on the two bases used throughout; the last three are start-list counts.")
+```
+
+In 2026, **`r sum(y26$f$utmb_index > TI)`** higher-rated runners reached the finish; in 2024 and
+2025 only **`r sum(y24$f$utmb_index > TI)`** and **`r sum(y25$f$utmb_index > TI)`** did. The elite
+tail says the same — `r sum(y26$s$utmb_index >= 900)` starters rated ≥ 900 in 2026 against
+`r sum(y24$s$utmb_index >= 900)` and `r sum(y25$s$utmb_index >= 900)`. Tangi did not get slower; the
+company got faster.
+
+That said, a thin field above him is not a floor under his rank. **In 2026,
+`r ahead_weaker` of the `r nrow(ahead26)` finishers ahead of him (`r percent(ahead_weaker/nrow(ahead26), 1)`)
+were rated at or below him.** Finishing rank is not bounded by higher-rated finishers: to be
+`r ord(tangi_rank26)` in 2024 he would need `r tangi_rank26 - 1L - (g("2024","seed_fin") - 1L)`
+lower-rated finishers ahead of him out of `r comma(y24$n_fin - (g("2024","seed_fin") - 1L))` available,
+which is entirely possible. A thin field above him makes a better placing the *expectation*, not a
+certainty — which is why the projected place is best read as a region.
+
+```{r context-table}
+proj |>
+  transmute(
+    Edition = year,
+    Starters = comma(n_start),
+    Finishers = comma(n_fin),
+    `DNF rate` = percent(dnf_rate, 1),
+    `Median index` = round(med_index),
+    `Par time at 758` = fmt_hms(par_h * 3600)
+  ) |>
+  kable(align = "lrrrrr")
+```
+
+```{r context-chart}
+#| fig-height: 4.2
+#| fig-cap: "Left: share of starters who did not finish. Right: the finish time a typical 758-index runner posted each year."
+cc <- proj |>
+  transmute(year, `Drop-out rate` = dnf_rate, `Par time at index 758` = par_h) |>
+  pivot_longer(-year, names_to = "metric", values_to = "value") |>
+  mutate(metric = factor(metric, levels = c("Drop-out rate", "Par time at index 758")),
+         lab = if_else(metric == "Drop-out rate", percent(value, 1), fmt_hms(value * 3600)))
+
+ggplot(cc, aes(year, value, fill = year)) +
+  geom_col(width = 0.62) +
+  geom_text(aes(label = lab), vjust = -0.4,
+            family = "Helvetica Neue", colour = ft_ink, size = 3.4) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_fill_manual(values = c(`2024` = ft_claret, `2025` = ft_orange, `2026` = ft_blue),
+                    guide = "none") +
+  scale_y_continuous(expand = expansion(c(0, 0.15))) +
+  labs(title = "A deeper field or a harder day costs places",
+       subtitle = "Attrition and the par time for a 758-index finisher, by edition.",
+       x = NULL, y = NULL, caption = srcline())
+```
+
+::: {.callout-note appearance="simple"}
+**Does a changed course break C and D?** For a *uniform* change — one that slows everyone by roughly
+the same amount — no, and this is testable rather than assumed. If the year effect were uniform, the
+index→time slope would be the same in every edition and only the intercept would move. It essentially
+does: `r round(coef(y24$fit)[2] * 60, 2)`, `r round(coef(y25$fit)[2] * 60, 2)` and
+`r round(coef(y26$fit)[2] * 60, 2)` min per index point over the fitted range, differences well
+inside the noise. A formal test for an index × edition interaction gives
+**p = `r sprintf("%.2f", int_p_restricted)`** over the fitted range and
+**p = `r sprintf("%.2f", int_p_full)`** over the whole field. The year effect really is a clean level shift, which is exactly the shape C
+and D assume — a point in their favour, and one worth testing rather than asserting.
+
+**What they do not absorb.** Three things. A *non-uniform* course change would reshuffle who is fast
+and break both. A change in the **index scale** between editions shifts the x-axis rather than the
+line, and lens D does not see it — that is dealt with [below](#drift). And **who finishes** differs
+by year (DNF rate `r percent(y24$dnf_rate,1)` / `r percent(y25$dnf_rate,1)` /
+`r percent(y26$dnf_rate,1)`), which truncates the slow tail differently and moves the very intercept
+D reads; restricting the fit to index `r FIT_LO`–`r FIT_HI` limits but does not eliminate this.
+:::
+
+# Is a 758 in 2026 a 758 in 2024? {#drift}
+
+The whole exercise drops a **2026-vintage** index into fields rated on the **2024 and 2025** scales.
+That is only legitimate if the scale has not moved.
+
+The scrape does return each edition's contemporaneous index rather than today's value — among
+runners matched across 2024 and 2026, only **`r round(pct_identical[["2024"]], 1)`%** carry an
+identical number. So the scale can drift, and it does. Measured within runner on those who ran two
+editions, the median index rose **+`r drift[["2024"]]` points from 2024 to 2026**
+(n = `r n_ret[["2024"]]`) and **+`r drift[["2025"]]` points from 2025 to 2026**
+(n = `r n_ret[["2025"]]`). At `r round(abs(coef(y26$fit)[2]) * 60, 1)` min per point, ten points is
+about half an hour of finish time — not a rounding error.
+
+Two things keep this from overturning the answer.
+
+**It is a known quantity, and correcting for it moves him a little.** Expressing his 758 on each
+year's own scale — `r TI - drift[["2024"]]` for 2024, `r TI - drift[["2025"]]` for 2025 — gives
+seeds of `r ord(g("2024","seed_fin_adj"))` and `r ord(g("2025","seed_fin_adj"))` among finishers
+instead of `r ord(g("2024","seed_fin"))` and `r ord(g("2025","seed_fin"))`, and moves lens C to
+`r ord(g("2024","adj_drift"))` (2024) and `r ord(g("2025","adj_drift"))` (2025) — some
+`r g("2024","adj_drift") - g("2024","adj_delta")` and
+`r g("2025","adj_drift") - g("2025","adj_delta")` places worse. Both remain comfortably ahead of
+`r ord(tangi_rank26)`, and both sit inside the region set out under
+[How firm is this?](#firm). Note also that
+returnees are a selected sample — runners who come back and get re-rated tend to be improving — so
+this correction is an **upper bound** on pure scale inflation, not a best estimate.
+
+**His own ratings say most of the rise was real.** Tangi's UTMB Index on race day 2025 was
+**`r TI_2025_actual`**, against `r TI` in 2026: **+`r TI - TI_2025_actual` points** in a year, where
+the population drifted **+`r drift[["2025"]]`**. At most half of his own improvement can be scale;
+the rest is a genuinely stronger runner. The counterfactual this report projects — a 2026-calibre
+Tangi in the 2025 field — is therefore a materially better runner than the 2025-vintage one, whether
+the comparison is made at `r TI` or at the drift-adjusted `r TI - drift[["2025"]]`.
+
+```{r drift-table}
+tibble(
+  `His index treated as` = c(
+    paste0(TI_2025_actual, " (his actual 2025 rating)"),
+    paste0(TI - drift[["2025"]], " / ", TI - drift[["2024"]], " (drift-adjusted)"),
+    paste0(TI, " (2026 value, as used)")),
+  `2024 seed` = c(ord(seed_fin(y24, TI_2025_actual)), ord(g("2024","seed_fin_adj")), ord(g("2024","seed_fin"))),
+  `2025 seed` = c(ord(seed_fin(y25, TI_2025_actual)), ord(g("2025","seed_fin_adj")), ord(g("2025","seed_fin"))),
+  `2026 seed` = c(ord(seed_fin(y26, TI_2025_actual)), ord(seed_fin(y26, TI)), ord(seedF26))
+) |>
+  kable(align = "lrrr",
+        caption = "Sensitivity of the finisher-basis seed to the index scale. The drift-adjusted row uses each year's own median returnee drift.")
+```
+
+# Bottom line
+
+```{r bottom-line}
+#| output: asis
+cat(paste0("- ", prior |>
+  mutate(txt = paste0("**", year, "**: about ", ord(central),
+                      " (", ord(spread_lo), "–", ord(spread_hi),
+                      " across the three methods) — some ", tangi_rank26 - central,
+                      " places ahead of his real ", ord(tangi_rank26),
+                      ", in a field of ", comma(n_fin), " finishers.")) |>
+  pull(txt), collapse = "\n"))
+```
+
+Run the same race in 2024 or 2025 and Tangi finishes around `r ord(g("2024","central"))` and
+`r ord(g("2025","central"))` respectively — some `r tangi_rank26 - g("2024","central")` to
+`r tangi_rank26 - g("2025","central")` places better than his real `r ord(tangi_rank26)`. The cause
+is the field, not the runner: 2026 brought `r sum(y26$f$utmb_index > TI)` higher-rated finishers to
+the line against `r sum(y24$f$utmb_index > TI)` and `r sum(y25$f$utmb_index > TI)` in those years. On
+a like-for-like basis his 2026 run was an ordinary one for a `r TI` index, and that ordinary run is
+what has been carried across.
+
+Read as a region rather than a place, that is roughly
+`r ord(firm("2024")[["lo"]])`–`r ord(firm("2024")[["hi"]])` in 2024 and
+`r ord(firm("2025")[["lo"]])`–`r ord(firm("2025")[["hi"]])` in 2025. Two things stop it from being
+sharper. His personal margin over par is
+`r round(resid26 / resid_sd26, 2)` standard deviations, measured on **one race** — remove it
+entirely and he still finishes `r ord(par_rank[["2024"]])` and `r ord(par_rank[["2025"]])`, so almost
+all of the gain is the field and almost none of it is him. And the index scale itself drifted by
+roughly `r drift[["2025"]]` points a year, which costs him about ten places once corrected. What
+survives both is the direction and its rough size.
+
+# Methodology {#methodology}
+
+Both working lenses transplant Tangi's **2026 run** onto the 2024 and 2025 fields. His 2026 UTMB
+Index is $I_T = `r TI`$; his real 2026 finish is $r_{26} = `r tangi_rank26`$ of `r comma(y26$n_fin)`
+finishers. Each edition uses the full field (finishers + DNFs) restricted to runners carrying an
+index.
+
+## Bases
+
+Everything is counted **among finishers**:
+
+$$\text{seed}_y = 1 + \#\{\, i \in \text{finishers}_y : I_i > I_T \,\}.$$
+
+Mixing a starter-basis seed with a finisher-basis rank is the error diagnosed in
+[the form section](#form): it removes `r comma(y26$n_dnf)` runners from the denominator but not the
+numerator and awards every finisher a spurious positive margin (median `r med_dS` places).
+
+## C · Seed-adjusted (rank-based)
+
+Form, measured like for like in 2026:
+
+$$\rho_F = \frac{r_{26}}{\text{seed}_{26}} = \frac{`r tangi_rank26`}{`r seedF26`} = `r round(formF_ratio, 2)`,
+\qquad
+\delta_F = \text{seed}_{26} - r_{26} = `r formF_delta`\ \text{places},$$
+
+projected as $\hat r^{\,\rho}_y = \rho_F \times \text{seed}_y$ and
+$\hat r^{\,\delta}_y = \text{seed}_y - \delta_F$. C uses only ranks and ratings, never a clock, so
+any change that slows the whole field equally leaves it untouched by construction. Its assumptions:
+the index is comparable across editions ([tested](#drift)); form is a stable personal trait
+(imposed by the question rather than tested — see [How firm is this?](#firm)); and the seed→finish
+relationship keeps a similar shape.
+
+**Robustness — is the finisher-basis seed a fluke of who dropped?** Fitting a per-edition logistic
+model of finishing on a natural spline in index and summing the fitted probabilities over the
+higher-rated starters gives the *expected* number of higher-rated finishers:
+
+```{r dnf-model}
+dnfm <- imap(ed, \(Y, yr) {
+  m  <- glm(fin ~ ns(utmb_index, 4), data = Y$s, family = binomial)
+  hi <- Y$s |> filter(utmb_index > TI)
+  tibble(Edition = yr,
+         `Higher-rated starters` = nrow(hi),
+         `Expected to finish` = round(sum(predict(m, hi, type = "response")), 1),
+         `Actually finished` = sum(hi$fin))
+}) |> list_rbind()
+kable(dnfm, align = "lrrr")
+```
+
+The realised counts sit within a few runners of the modelled expectation in every edition, so the
+between-year differences in seed reflect the composition of the field rather than a lucky or unlucky
+pattern of drop-outs.
+
+## D · Index-residual time model
+
+Fit $\widehat{\text{time}}_y(I) = a_y + b_y I$ on year $y$'s finishers, take his personal margin
+$\varepsilon = \text{time}_T - \widehat{\text{time}}_{26}(I_T)$, which is `r mins(resid26)` faster
+than par, and rank $\hat t_y = \widehat{\text{time}}_y(I_T) + \varepsilon$ against that year's finishers.
+
+**Range restriction.** The fit uses index `r FIT_LO`–`r FIT_HI` rather than the whole field. Below
+that range the sample is heavily truncated by the cut-off and the truncation differs by year (DNF
+rate `r percent(y24$dnf_rate,1)` / `r percent(y25$dnf_rate,1)` / `r percent(y26$dnf_rate,1)`), which
+flattens the bottom of the line and biases exactly the intercept D reads. The effect is material:
+over the full range the par time at `r TI` is `r fmt_hms(g("2024","par_h_full")*3600)` (2024) against
+`r fmt_hms(pred26_full*3600)` (2026), a gap of `r mins(g("2024","par_h_full") - pred26_full)`;
+restricted, it is `r fmt_hms(g("2024","par_h")*3600)` against `r fmt_hms(pred26*3600)`, a gap of
+`r mins(g("2024","par_h") - pred26)`. Roughly a quarter of the apparent "2024 was a slower year"
+signal is selection. The full-range projections are shown alongside the restricted ones in the
+[lens table](#the-lenses); they differ by `r abs(g("2024","model_full") - g("2024","model"))` places
+in 2024 and `r abs(g("2025","model_full") - g("2025","model"))` in 2025.
+
+**Assumption.** $\varepsilon$ is constant in absolute hours. If a year were much harder, a strong
+runner's absolute advantage might grow, which D would under-count — so D is, if anything, slightly
+conservative in the hardest year. Fit quality: $R^2 \approx `r round(summary(y26$fit)$r.squared, 2)`$ over the restricted range,
+against `r round(summary(y26$fit_full)$r.squared, 2)` over the whole field — the drop is range
+attenuation, not a worse model, and Tangi sits in the middle of the fitted range.
+
+## The reported range, and what it is not
+
+The range in the headline table is the **spread across the three methods** (C-delta, C-ratio, D). It
+is reported because it shows the arithmetic is not knife-edged, and it is explicitly **not** a
+confidence interval: three deterministic recipes sharing a single input cannot disagree about that
+input, so their agreement measures nothing about how well the input is known.
+
+The uncertainty that *can* be quantified from this data is sampling error in the two fitted lines
+behind lens D. Bootstrapping both fits over the restricted range (600 replicates, resampling
+finishers with replacement) gives `r ord(bd("2024","lo"))`–`r ord(bd("2024","hi"))` for 2024 and
+`r ord(bd("2025","lo"))`–`r ord(bd("2025","hi"))` for 2025 — several times the spread across methods,
+and still only one term. The others are set out in [How firm is this?](#firm): the thinness of the
+transplanted margin (a zero-margin run costs him
+`r par_rank[["2024"]] - g("2024","model")`–`r par_rank[["2025"]] - g("2025","model")` places), the
+density of finishers around his projected time, and the chance of not finishing at all. None is
+folded into a single published interval, because doing so would require assuming a distribution for
+the one quantity — his form on a day he did not run — that is genuinely unknown.
+
+## What is excluded
+
+Raw time (B) is reported but not used: it is blind to conditions and to any course change, and it
+implies he would have finished `r ord(g("2024","raw_time"))` in 2024 — better than every
+field-strength-aware lens — purely because 2024 was a slower year. Seed (A) is reported as the input
+to C. A *non-uniform*
+course change — a materially more technical or higher route — would break both working lenses;
+across 2024–2026 UTMB ran essentially the same classic loop
+(`r round(173.6, 1)` km reconstructed in 2026 against 176.7 km in 2024 and 175.4 km in 2025), so this
+is treated as second-order.
+
+```{r write-csv}
+#| include: false
+proj |>
+  left_join(boot_D |> select(year, boot_lo = lo, boot_hi = hi), by = "year") |>
+  select(year, n_start, n_fin, dnf_rate, med_index,
+         seed_start, seed_fin, seed_fin_adj,
+         raw_time, adj_delta, adj_ratio, adj_drift, model, model_full,
+         central, spread_lo, spread_hi, boot_lo, boot_hi,
+         par_h, par_h_full, proj_time_h) |>
+  write_csv("../data/processed/tangi_cross_year.csv")
+```

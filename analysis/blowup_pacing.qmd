@@ -1,0 +1,537 @@
+---
+title: "Fast starts and blow-ups at the UTMB"
+subtitle: "Whether going out ahead of your rating leads to dropping out depends on the runner — and the direction reverses as ability rises. Measured continuously on 2,382 starters, then re-tested on the 2024 and 2025 editions."
+author: "Alexis Konarski"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-title: "Contents"
+    theme: ft.scss
+    number-sections: false
+    df-print: kable
+    fig-width: 8
+    fig-height: 5
+    fig-dpi: 160
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(scales)
+library(stringr)
+library(splines)
+
+source("ft_style.R")
+theme_set(theme_ft())
+
+band_levels <- c("Index <600", "Index 600–700", "Index 700–800", "Index 800+")
+band_cols   <- c("Index <600" = ft_blue, "Index 600–700" = ft_teal,
+                 "Index 700–800" = ft_orange, "Index 800+" = ft_claret)
+cause_cols  <- c("Timed out (cut-off)" = ft_teal, "Abandoned" = ft_claret)
+tert_lab    <- c("Conservative", "Even", "Fast (for ability)")
+tert_cols   <- c("Conservative" = ft_blue, "Even" = ft_neutral,
+                 "Fast (for ability)" = ft_orange)
+
+# p-values with a floor, so nothing ever prints as "p=0.00".
+fmt_p <- function(p) if (p < 0.001) "p < 0.001" else sprintf("p = %.3f", p)
+```
+
+```{r load}
+source("../R/checkpoints.R")
+
+# --- One edition -----------------------------------------------------------
+# The pointId scheme is NOT shared across editions (2026 numbers its timing
+# points 4/6/10/...; 2024 and 2025 use 2/3/4/...), and no endpoint maps a
+# pointId to a place. `derive_checkpoints()` rebuilds each edition's distance
+# table from the passings themselves (speed x split time); it reproduces the
+# hand-read 2026 table to within 0.1 km. Anchors are then chosen by DISTANCE,
+# so the same points on the course are compared across years.
+prep_edition <- function(year) {
+  suffix <- if (year == 2026) "" else str_glue("_{year}")
+  runners <- read_csv(str_glue("../data/processed/runners_all_utmb{suffix}.csv"),
+                      show_col_types = FALSE)
+  pass    <- read_csv(str_glue("../data/processed/passings_all_utmb{suffix}.csv"),
+                      show_col_types = FALSE)
+
+  cp <- derive_checkpoints(pass) |> filter(sec_km > 0)
+  at_km <- function(km) cp$point_id[which.min(abs(cp$cum_km - km))]
+  p_voza <- cp$point_id[1]                 # first timing point (~14 km, the gun)
+  p_cont <- at_km(32.4)                    # Les Contamines
+  p_cour <- at_km(81.3)                    # Courmayeur
+
+  n_raw <- nrow(runners)
+  field <- runners |>
+    filter(outcome %in% c("Finisher", "DNF"), !is.na(utmb_index)) |>
+    mutate(
+      year  = year,
+      dnf   = outcome == "DNF",
+      band  = cut(utmb_index, c(-Inf, 600, 700, 800, Inf), labels = band_levels),
+      cause = case_when(status == "a"  ~ "Abandoned",
+                        status == "hd" ~ "Timed out (cut-off)",
+                        .default = "Other")
+    )
+
+  # Cumulative elapsed hours at each anchor. `cumulated_time` is the genuine
+  # cumulative hms. (The `split_time_seconds` column is mislabelled: it too is
+  # cumulative, not the section split — the section split is `split_time`.)
+  cum_at <- function(pid, nm) {
+    pass |> filter(point_id == pid, !is.na(cumulated_time)) |>
+      transmute(bib, "{nm}" := as.numeric(cumulated_time) / 3600)
+  }
+  field <- field |>
+    left_join(cum_at(p_voza, "t_voza"), by = "bib") |>
+    left_join(cum_at(p_cont, "t_cont"), by = "bib")
+
+  # Distance reached before dropping out, and whether the drop came after
+  # Courmayeur (used for the reverse-causation check).
+  reached_cour <- pass |> filter(point_id == p_cour, !is.na(cumulated_time)) |> pull(bib)
+  field <- field |>
+    left_join(cp |> select(point_id, cum_km), by = c("last_point_id" = "point_id")) |>
+    mutate(reached_cour = bib %in% reached_cour)
+
+  list(field = field, cp = cp, n_raw = n_raw,
+       km_voza = cp$cum_km[1], km_cont = cp$cum_km[cp$point_id == p_cont],
+       km_cour = cp$cum_km[cp$point_id == p_cour])
+}
+
+# --- Overpace --------------------------------------------------------------
+# Time at a checkpoint, residualised on the UTMB Index with a natural spline.
+# Positive = arrived FASTER than the rating predicts.
+#
+# Two deliberate departures from a first pass at this:
+#  * a SPLINE, not a straight line. Fitting a line leaves real index structure
+#    inside the "residual" -- inside the 800+ band the linear residual still
+#    correlated -0.48 with the index, so "fast start" there partly just meant
+#    "lower-rated within the band". The spline drives that to ~0 (checked below).
+#  * NO median normalisation. Dividing the time by the field-median time at the
+#    same point divides by a constant, so after residualising on the index it
+#    changes nothing at all. Working in raw hours keeps the units readable.
+overpace <- function(time_h, index, df = 4) {
+  ok  <- is.finite(time_h) & is.finite(index)
+  out <- rep(NA_real_, length(time_h))
+  out[ok] <- -resid(lm(time_h[ok] ~ ns(index[ok], df = df)))
+  out
+}
+
+eds <- map(c(2024, 2025, 2026), prep_edition) |> set_names(c("2024", "2025", "2026"))
+
+dat <- eds[["2026"]]$field |>
+  mutate(op_voza = overpace(t_voza, utmb_index),
+         op_cont = overpace(t_cont, utmb_index),
+         opz_voza = op_voza / sd(op_voza, na.rm = TRUE))
+
+n_raw   <- eds[["2026"]]$n_raw
+n_field <- nrow(dat); n_dnf <- sum(dat$dnf)
+km_voza <- round(eds[["2026"]]$km_voza, 1)
+km_cont <- round(eds[["2026"]]$km_cont, 1)
+
+# Reproducibility artifact.
+dat |>
+  transmute(bib, fullname, sex, category, utmb_index, band, outcome, dnf, cause,
+            last_point_id, cum_km, reached_cour, t_voza, t_cont, op_voza, op_cont) |>
+  write_csv("../data/processed/pacing_blowup_utmb.csv")
+```
+
+```{r bandstats}
+bs <- dat |>
+  summarise(n = n(), rate = mean(dnf), dnf = sum(dnf),
+            abandon = sum(cause == "Abandoned"),
+            cutoff  = sum(cause == "Timed out (cut-off)"),
+            .by = band) |>
+  mutate(band = factor(band, band_levels)) |> arrange(band)
+gb <- function(b, col) bs[[col]][bs$band == b]
+
+# Tertiles of early pace WITHIN each band; DNF rate per (band, tertile).
+tert_tab <- function(col) {
+  dat |> filter(is.finite(.data[[col]])) |>
+    mutate(tert = cut(.data[[col]], quantile(.data[[col]], c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                      labels = tert_lab, include.lowest = TRUE), .by = band) |>
+    summarise(dnf = mean(dnf), n = n(), .by = c(band, tert)) |>
+    mutate(band = factor(band, band_levels), tert = factor(tert, tert_lab))
+}
+tt_voza <- tert_tab("op_voza")
+tt_cont <- tert_tab("op_cont")
+gt <- function(tab, b, t) tab$dnf[tab$band == b & tab$tert == t]
+```
+
+Trail-running lore holds that starting too fast makes runners blow up. The 2026 UTMB — `r comma(n_field)` starters, each with a pre-race rating and a timestamp at every checkpoint — lets us test it, and the 2024 and 2025 editions let us check whether the answer repeats.
+
+**How the question is posed.** A fast early split often just means a strong runner, so we measure early pace *relative to ability*: each runner's elapsed time at a checkpoint, with the effect of their **UTMB Index** removed by a flexible (spline) fit over the whole field. What is left is **overpace** — positive means arriving faster than the rating predicts.
+
+The primary reading is taken at the **first timing point, Col de Voza (`r km_voza` km)**: it is the closest thing the race has to a measurement of intent off the gun, before anyone has had time to correct course. Les Contamines (`r km_cont` km) is carried alongside as a check.
+
+# Who drops out, and why
+
+The four bands fail at different rates and for different reasons. Above an index of 600, time cut-offs essentially disappear.
+
+```{r}
+#| label: fig-band-cause
+#| fig-cap: "Bars stacked into the two DNF causes; the number above each is the band's total DNF rate."
+band_cause <- dat |> filter(dnf) |>
+  summarise(n = n(), .by = c(band, cause)) |>
+  left_join(bs |> select(band, band_n = n), by = "band") |>
+  mutate(rate = n / band_n, band = factor(band, band_levels),
+         cause = factor(cause, names(cause_cols)))
+
+ggplot(band_cause, aes(band, rate, fill = cause)) +
+  geom_col(width = 0.62) +
+  geom_text(data = bs, aes(band, rate, label = percent(rate, 1)),
+            inherit.aes = FALSE, vjust = -0.4, size = 3.3, colour = ft_ink) +
+  scale_fill_manual(values = cause_cols, name = NULL) +
+  scale_y_continuous(labels = percent_format(), expand = expansion(c(0, 0.12))) +
+  labs(x = NULL, y = "DNF rate",
+       title = "Cut-offs disappear as ability rises; the strong drop by choice",
+       subtitle = "DNF rate by ability band, split into voluntary abandons and time cut-offs",
+       caption = ft_source()) +
+  theme(legend.position = "top")
+```
+
+The elite band (800+) has the highest DNF rate at `r percent(gb("Index 800+","rate"), 1)` — and every one of those `r gb("Index 800+","dnf")` non-finishers walked away by choice, not because the clock caught them. In the lowest band, by contrast, `r round(100*gb("Index <600","cutoff")/gb("Index <600","dnf"))`% of non-finishers were timed out.
+
+```{r kmdrop}
+dnf_where <- dat |> filter(dnf, !is.na(cum_km))
+dwb <- dnf_where |> summarise(med = median(cum_km), n = n(), .by = band) |>
+  mutate(band = factor(band, band_levels)) |> arrange(band)
+kw <- kruskal.test(cum_km ~ band, data = dnf_where)
+share_early <- dnf_where |>
+  summarise(early = mean(cum_km < eds[["2026"]]$km_cour), .by = band) |>
+  mutate(band = factor(band, band_levels)) |> arrange(band)
+ge <- function(b) share_early$early[share_early$band == b]
+gm <- function(b) dwb$med[dwb$band == b]
+```
+
+Where runners stop is **not** the same across bands (Kruskal-Wallis `r fmt_p(kw$p.value)`) — and the pattern is not the obvious one. It is U-shaped: the weakest and the strongest both quit early, around Courmayeur, while the two middle bands push on well past it.
+
+```{r}
+#| label: fig-band-where
+#| fig-cap: "Distribution of the furthest point reached by each band's non-finishers, as a share of that band's DNFs so the bands are directly comparable. Dashed line = band median."
+dnf_where |>
+  mutate(band = factor(band, band_levels)) |>
+  ggplot(aes(cum_km)) +
+  geom_histogram(aes(y = after_stat(density) * 12, fill = band),
+                 binwidth = 12, colour = ft_paper, show.legend = FALSE) +
+  geom_vline(data = dwb, aes(xintercept = med), linetype = "dashed", colour = ft_ink) +
+  facet_wrap(~band, ncol = 1) +
+  scale_fill_manual(values = band_cols) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(x = "Distance reached before dropping out (km)", y = "Share of the band's DNFs",
+       title = "The weakest and the strongest quit early; the middle grinds on",
+       subtitle = str_glue("Furthest point reached by non-finishers, as a share of each band's DNFs · dashed line = band median"),
+       caption = ft_source())
+```
+
+Median distance reached: **`r round(gm("Index <600"))` km** for the sub-600 band and **`r round(gm("Index 800+"))` km** for the elite, against **`r round(gm("Index 600–700"))` km** and **`r round(gm("Index 700–800"))` km** for the two middle bands. The share quitting before Courmayeur runs `r percent(ge("Index <600"),1)` / `r percent(ge("Index 600–700"),1)` / `r percent(ge("Index 700–800"),1)` / `r percent(ge("Index 800+"),1)`. The two ends of the field arrive at the same exit for opposite reasons: the weakest are squeezed out by the cut-offs, the strongest step off once the result they came for is gone.
+
+# A fast start: protective for the weak, a hazard for the strong
+
+Sorting each band into thirds by early pace shows the effect of a fast start reversing as ability climbs. For weak runners it is the single best sign in the data; for the 700–800 band it looks like a liability — though, as the cross-edition check below shows, that half of the picture is the shakier one.
+
+```{r}
+#| include: false
+tertile_plot <- function(tab, where_label, title) {
+  ggplot(tab, aes(band, dnf, fill = tert)) +
+    geom_col(position = position_dodge(0.8), width = 0.74) +
+    geom_text(aes(label = percent(dnf, 1)), position = position_dodge(0.8),
+              vjust = -0.35, size = 2.8, colour = ft_ink) +
+    scale_fill_manual(values = tert_cols, name = "Start (for ability)") +
+    scale_y_continuous(labels = percent_format(), expand = expansion(c(0, 0.12))) +
+    labs(x = NULL, y = "DNF rate", title = title,
+         subtitle = str_glue("DNF rate by ability band and early-pace tertile · measured at {where_label}"),
+         caption = ft_source()) +
+    theme(legend.position = "top")
+}
+```
+
+::: {.panel-tabset}
+
+### Col de Voza · `r km_voza` km (primary)
+
+```{r}
+#| label: fig-tertile-voza
+#| fig-cap: "DNF rate by ability band and early-pace tertile, measured off the gun at Col de Voza. Within each band, runners are split into equal thirds by overpace."
+tertile_plot(tt_voza, str_glue("Col de Voza ({km_voza} km)"),
+             "Off the gun, the gradient runs one way below 600 and the other way above 700")
+```
+
+### Les Contamines · `r km_cont` km (check)
+
+```{r}
+#| label: fig-tertile-cont
+#| fig-cap: "The same split, read 18 km later at Les Contamines. The gradients survive but flatten, as runners who set off too hard rein it in."
+tertile_plot(tt_cont, str_glue("Les Contamines ({km_cont} km)"),
+             "Read 18 km later, the same gradients survive but flatten")
+```
+
+:::
+
+Reading across the bands at Col de Voza:
+
+- **Index < 600.** A faster start goes with a **lower** DNF rate at every step: `r percent(gt(tt_voza,"Index <600","Conservative"),1)` for the most conservative third, `r percent(gt(tt_voza,"Index <600","Even"),1)` for the middle, `r percent(gt(tt_voza,"Index <600","Fast (for ability)"),1)` for the fastest. For a modest rating, going out ahead of schedule mostly means the index **under-rates** the runner; it also banks cut-off margin, the one band where that matters.
+- **Index 600–700.** No clear pacing effect either way.
+- **Index 700–800.** The order reverses: `r percent(gt(tt_voza,"Index 700–800","Conservative"),1)`, `r percent(gt(tt_voza,"Index 700–800","Even"),1)`, `r percent(gt(tt_voza,"Index 700–800","Fast (for ability)"),1)`. This is the folklore's band — in this edition.
+- **Index 800+.** High whatever the pacing (`r percent(gt(tt_voza,"Index 800+","Conservative"),1)` to `r percent(gt(tt_voza,"Index 800+","Fast (for ability)"),1)`), on only `r gb("Index 800+","n")` runners.
+
+# The reversal, measured properly
+
+Cutting the field into four bands is convenient but arbitrary — the boundaries at 600, 700 and 800 are round numbers, and testing each band separately throws away most of the data at each step. The claim being made is really a single one: **the effect of a fast start changes sign as ability rises.** That can be fitted, and tested, in one model.
+
+```{r contmodel}
+md <- dat |> filter(is.finite(op_voza))
+nsB <- ns(md$utmb_index, df = 4)
+B <- as.data.frame(unclass(nsB)); names(B) <- paste0("b", 1:4)
+md2 <- bind_cols(md |> select(dnf, utmb_index, opz_voza), B)
+
+m_int  <- glm(dnf ~ (b1 + b2 + b3 + b4) * opz_voza, binomial, md2)
+m_flat <- glm(dnf ~ (b1 + b2 + b3 + b4) + opz_voza, binomial, md2)
+lrt <- anova(m_flat, m_int, test = "LRT")
+lrt_chi <- lrt$Deviance[2]; lrt_df <- lrt$Df[2]; lrt_p <- lrt$`Pr(>Chi)`[2]
+
+# OR per +1 SD of overpace as a smooth function of the index (delta method).
+xs <- seq(quantile(md$utmb_index, .01), quantile(md$utmb_index, .99), length.out = 200)
+NB <- as.data.frame(predict(nsB, xs)); names(NB) <- paste0("b", 1:4)
+tt <- delete.response(terms(m_int))
+C  <- model.matrix(tt, bind_cols(tibble(opz_voza = 1), NB)) -
+      model.matrix(tt, bind_cols(tibble(opz_voza = 0), NB))
+est <- as.vector(C %*% coef(m_int)); se <- sqrt(rowSums((C %*% vcov(m_int)) * C))
+slope <- tibble(index = xs, or = exp(est), lo = exp(est - 1.96*se), hi = exp(est + 1.96*se))
+
+cross    <- slope |> filter(or >= 1) |> slice_min(index, n = 1) |> pull(index)
+prot_to  <- slope |> filter(hi < 1) |> pull(index) |> max()
+harm_from <- slope |> filter(lo > 1) |> pull(index) |> min()
+or_at <- function(x) slope |> slice_min(abs(index - x), n = 1)
+```
+
+The answer is unambiguous: allowing the pacing effect to vary with ability improves the fit enormously (χ² = `r round(lrt_chi, 1)` on `r lrt_df` df, `r fmt_p(lrt_p)`). A fast start does not have *an* effect on dropping out — it has opposite effects at opposite ends of the field, and one number for the whole race is meaningless.
+
+```{r}
+#| label: fig-slope-curve
+#| fig-cap: "DNF odds ratio per +1 SD of overpace at Col de Voza, as a continuous function of the UTMB Index, with a 95% band. Above 1 = a fast start raises DNF risk; below 1 = it lowers it."
+ggplot(slope, aes(index, or)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = ft_ink) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = ft_blue, alpha = 0.16) +
+  geom_line(colour = ft_blue, linewidth = 1) +
+  annotate("rect", xmin = 700, xmax = 800, ymin = -Inf, ymax = Inf,
+           fill = ft_orange, alpha = 0.13) +
+  annotate("segment", x = c(700, 800), xend = c(700, 800), y = 0.2, yend = 5,
+           colour = ft_orange, linewidth = 0.3, alpha = 0.6) +
+  annotate("text", x = 750, y = 4.4, label = "700–800\nband",
+           size = 2.9, colour = ft_orange, fontface = "bold", lineheight = 0.95) +
+  annotate("text", x = min(xs), y = 0.92, label = "a fast start protects",
+           hjust = 0, vjust = 1, size = 3, colour = ft_ink2) +
+  annotate("text", x = max(xs), y = 1.08, label = "a fast start harms",
+           hjust = 1, vjust = 0, size = 3, colour = ft_ink2) +
+  scale_y_log10(breaks = c(0.25, 0.5, 1, 2, 4)) +
+  coord_cartesian(ylim = c(0.2, 5)) +
+  labs(x = "UTMB Index (higher = stronger)",
+       y = "DNF odds ratio per +1 SD overpace  (log scale)",
+       title = "A fast start protects the weak and punishes the strong",
+       subtitle = str_glue("Effect of early overpace on DNF odds, allowed to vary smoothly with ability · crosses 1 at index ≈ {round(cross)}"),
+       caption = ft_source("Shaded band = 95% confidence interval"))
+```
+
+The curve crosses 1 at an index of about **`r round(cross)`**. Below **`r round(prot_to)`** a fast start is *significantly protective*; from **`r round(harm_from)`** upward it is *significantly harmful*. In the 700–800 band the odds ratio is around **`r sprintf('%.2f', or_at(750)$or)`** per standard deviation (95% CI `r sprintf('%.2f–%.2f', or_at(750)$lo, or_at(750)$hi)`). Above 850 the band opens out and the data stops saying anything useful — there are only `r gb("Index 800+","n")` runners up there, which is the honest reason the elite band looked "flat" in the bar chart.
+
+```{r}
+#| label: fig-slices
+#| fig-cap: "Fitted DNF probability against how hard a runner set off, at four ability levels. The lines fan the opposite way at the two ends of the field."
+#| fig-height: 4.6
+lvl <- c(500, 600, 700, 800)
+go  <- seq(quantile(md$opz_voza, .05), quantile(md$opz_voza, .95), length.out = 80)
+gr  <- expand_grid(utmb_index = lvl, opz_voza = go)
+GB  <- as.data.frame(predict(nsB, gr$utmb_index)); names(GB) <- paste0("b", 1:4)
+pr  <- predict(m_int, bind_cols(gr |> select(opz_voza), GB), type = "link", se.fit = TRUE)
+gr  <- gr |> mutate(p = plogis(pr$fit),
+                    lo = plogis(pr$fit - 1.96*pr$se.fit),
+                    hi = plogis(pr$fit + 1.96*pr$se.fit),
+                    lab = factor(str_glue("Index {utmb_index}"),
+                                 levels = str_glue("Index {lvl}")))
+
+ggplot(gr, aes(opz_voza, p)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = ft_ink2, linewidth = 0.4) +
+  geom_ribbon(aes(ymin = lo, ymax = hi, fill = lab), alpha = 0.18, show.legend = FALSE) +
+  geom_line(aes(colour = lab), linewidth = 1, show.legend = FALSE) +
+  facet_wrap(~lab, nrow = 1) +
+  scale_colour_manual(values = unname(band_cols)) +
+  scale_fill_manual(values = unname(band_cols)) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_x_continuous(breaks = c(-1, 0, 1),
+                     labels = c("slower", "on\nrating", "faster")) +
+  labs(x = "Start, relative to rating (SD of overpace)", y = "Fitted DNF probability",
+       title = "The same start means opposite things at opposite ends of the field",
+       subtitle = "Fitted DNF probability against early pace, at four ability levels · 95% bands",
+       caption = ft_source())
+```
+
+Read left to right, the slope of those four lines simply turns over: at an index of 500 setting off hard is associated with a **lower** chance of dropping out, by 700 and 800 with a **higher** one, and 600 is roughly the pivot.
+
+# Does it repeat? 2024 and 2025
+
+A single edition, and a result that turns on one slice of the field, invites the obvious worry: is this the shape of a real effect, or of one year's noise? The 2024 and 2025 editions are an independent test — essentially the same course, different weather, largely different runners. Two separate things are worth asking. Does the **reversal** repeat? And does the **penalty on strong runners** specifically repeat?
+
+```{r repl}
+# Fit the same continuous model to each edition and extract (a) the reversal
+# test, (b) the OR curve, (c) the 700-800 band on its own.
+fit_edition <- function(nm) {
+  d <- eds[[nm]]$field |> mutate(op = overpace(t_voza, utmb_index)) |>
+    filter(is.finite(op)) |> mutate(z = op / sd(op))
+
+  nb <- ns(d$utmb_index, df = 4)
+  BB <- as.data.frame(unclass(nb)); names(BB) <- paste0("b", 1:4)
+  dd <- bind_cols(d |> select(dnf, z), BB)
+  m  <- glm(dnf ~ (b1+b2+b3+b4) * z, binomial, dd)
+  a  <- anova(glm(dnf ~ (b1+b2+b3+b4) + z, binomial, dd), m, test = "LRT")
+
+  xs <- seq(quantile(d$utmb_index, .01), quantile(d$utmb_index, .99), length.out = 200)
+  NB <- as.data.frame(predict(nb, xs)); names(NB) <- paste0("b", 1:4)
+  tt <- delete.response(terms(m))
+  C  <- model.matrix(tt, bind_cols(tibble(z = 1), NB)) -
+        model.matrix(tt, bind_cols(tibble(z = 0), NB))
+  e  <- as.vector(C %*% coef(m)); se <- sqrt(rowSums((C %*% vcov(m)) * C))
+  cur <- tibble(year = nm, index = xs, or = exp(e),
+                lo = exp(e - 1.96*se), hi = exp(e + 1.96*se))
+
+  b78 <- d |> filter(utmb_index >= 700, utmb_index < 800)
+  m78 <- glm(dnf ~ z, binomial, b78); ci <- suppressMessages(confint(m78))
+  tq  <- quantile(b78$z, c(0, 1/3, 2/3, 1))
+  tr  <- b78 |> mutate(t = cut(z, tq, labels = tert_lab, include.lowest = TRUE)) |>
+    summarise(r = mean(dnf), .by = t)
+
+  prot <- cur |> filter(hi < 1) |> pull(index)
+  harm <- cur |> filter(lo > 1) |> pull(index)
+  list(curve = cur, summ = tibble(
+    year = nm, n_field = nrow(d), dnf_rate = mean(d$dnf),
+    int_chi = a$Deviance[2], int_p = a$`Pr(>Chi)`[2],
+    cross = {x <- cur |> filter(or >= 1) |> pull(index); if (length(x)) min(x) else NA_real_},
+    prot_below = if (length(prot)) max(prot) else NA_real_,
+    harm_above = if (length(harm)) min(harm) else NA_real_,
+    n78 = nrow(b78), dnf78 = mean(b78$dnf),
+    cons78 = tr$r[tr$t == "Conservative"], fast78 = tr$r[tr$t == "Fast (for ability)"],
+    or78 = exp(coef(m78)[["z"]]), lo78 = exp(ci["z",1]), hi78 = exp(ci["z",2]),
+    p78 = coef(summary(m78))["z", "Pr(>|z|)"]))
+}
+fits    <- map(names(eds), fit_edition) |> set_names(names(eds))
+curves  <- map(fits, "curve") |> list_rbind()
+rep_all <- map(fits, "summ")  |> list_rbind()
+gr2 <- function(y, c) rep_all[[c]][rep_all$year == y]
+yr_cols <- c(`2024` = ft_claret, `2025` = ft_orange, `2026` = ft_blue)
+```
+
+```{r}
+#| label: fig-replication-curve
+#| fig-cap: "The same model fitted separately to each edition: DNF odds ratio per +1 SD of early overpace, against ability. All three curves slope the same way — protective on the left, harmful on the right."
+#| fig-height: 4.4
+ggplot(curves, aes(index, or)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = ft_ink) +
+  geom_ribbon(aes(ymin = lo, ymax = hi, fill = year), alpha = 0.15) +
+  geom_line(aes(colour = year), linewidth = 0.9) +
+  facet_wrap(~year) +
+  scale_colour_manual(values = yr_cols, guide = "none") +
+  scale_fill_manual(values = yr_cols, guide = "none") +
+  scale_y_log10(breaks = c(0.25, 0.5, 1, 2, 4)) +
+  coord_cartesian(ylim = c(0.2, 5)) +
+  labs(x = "UTMB Index (higher = stronger)",
+       y = "DNF odds ratio per +1 SD overpace",
+       title = "The reversal is in all three editions; its harmful end is not always sharp",
+       subtitle = "Effect of early overpace on DNF odds by ability, fitted separately per edition · 95% bands",
+       caption = ft_source(editions = "2024–2026 editions"))
+```
+
+```{r}
+#| label: tbl-replication
+rep_all |>
+  transmute(Edition = year,
+            Starters = comma(n_field),
+            `DNF rate` = percent(dnf_rate, 1),
+            `Reversal test` = map_chr(int_p, fmt_p),
+            `Protective below` = round(prot_below),
+            `Crosses 1 at` = round(cross),
+            `Harmful above` = ifelse(is.na(harm_above), "—", as.character(round(harm_above))),
+            `700–800: OR per SD` = sprintf("%.2f (%.2f–%.2f)", or78, lo78, hi78)) |>
+  knitr::kable(align = "lrrrrrrr",
+    caption = "Each edition fitted separately. 'Protective below' and 'harmful above' are the index values at which the 95% band clears 1 on each side; '—' means it never does.")
+```
+
+**The reversal itself replicates decisively.** In every edition, allowing the pacing effect to vary with ability beats holding it constant — `r fmt_p(gr2("2024","int_p"))` in 2024, `r fmt_p(gr2("2025","int_p"))` in 2025, `r fmt_p(gr2("2026","int_p"))` in 2026. And the protective end replicates with it: in all three years a fast start *significantly lowers* DNF risk for runners below an index of roughly `r round(min(rep_all$prot_below))`–`r round(max(rep_all$prot_below))`. That half of the finding is about as solid as a single race series can make it.
+
+**The half that matches the folklore is weaker than the 2026 data alone suggests.** The three curves all slope upward and all sit above 1 at the top end, but only 2026 has a stretch where the confidence band clears 1 on the harmful side. Read on the 700–800 band alone:
+
+```{r}
+#| label: fig-replication-band
+#| fig-cap: "DNF odds ratio per +1 SD of early overpace within the 700–800 band, by edition, with 95% intervals. Directionally consistent, but clearly separated from 1 only in 2026."
+ggplot(rep_all, aes(or78, year)) +
+  geom_vline(xintercept = 1, linetype = 2, colour = ft_ink2) +
+  geom_errorbarh(aes(xmin = lo78, xmax = hi78, colour = year), height = 0.2, linewidth = 0.8) +
+  geom_point(aes(colour = year), size = 3.6) +
+  geom_text(aes(label = sprintf("OR %.2f  (%s)", or78, map_chr(p78, fmt_p))),
+            vjust = -1.3, size = 3, colour = ft_ink) +
+  scale_colour_manual(values = yr_cols, guide = "none") +
+  scale_x_log10() +
+  labs(x = "DNF odds ratio per +1 SD overpace at the first timing point  (log scale)",
+       y = NULL,
+       title = "The 700–800 penalty is clear in 2026 and absent in the two prior years",
+       subtitle = "Per-edition logistic slope of DNF on early overpace, 700–800 band only, 95% intervals",
+       caption = ft_source(editions = "2024–2026 editions"))
+```
+
+In 2026 the conservative third of that band finished at `r percent(gr2("2026","cons78"),1)` DNF against `r percent(gr2("2026","fast78"),1)` for the fastest third — a wide gap. In 2024 the same split is `r percent(gr2("2024","cons78"),1)` against `r percent(gr2("2024","fast78"),1)`, and in 2025 `r percent(gr2("2025","cons78"),1)` against `r percent(gr2("2025","fast78"),1)`: no gap worth the name. Each edition offers only about `r round(mean(rep_all$n78))` runners in that band, so none of these three intervals is decisive on its own — but had the 2026 effect been a stable property of that ability range, it should have left some trace in the other two, and it did not.
+
+Note also that 2024 and 2025 were harder races at that level: the 700–800 band lost `r percent(gr2("2024","dnf78"),1)` and `r percent(gr2("2025","dnf78"),1)` of its runners against `r percent(gr2("2026","dnf78"),1)` in 2026. When a third of a band is going out whatever it does, there is less room for a pacing choice to matter — a plausible reason the effect is easiest to see in the kindest of the three years, and a reason not to read its absence in 2024–25 as a flat contradiction.
+
+# Is it the pacing, or was the fast starter already in trouble?
+
+The obvious alternative explanation is reverse causation of a particular kind: a runner already having a bad day might show up as *slow*-for-ability at 14 km, making conservative starts look worse than they are. Or the reverse — the "fast" starters might simply be the ones who were going to blow up anyway, visible early.
+
+One way to separate them is to ask *when* the fast starters drop. If a hot start is genuinely spending a resource, the cost should fall due later, out on the course — not in the first few hours. The test below is run on the 2026 700–800 band, i.e. on the one edition and slice where the harmful effect is clearly present at all.
+
+```{r probe}
+probe <- dat |> filter(is.finite(op_voza), utmb_index >= 700, utmb_index < 800)
+# (a) everyone in the band, any DNF
+pa <- glm(dnf ~ opz_voza, binomial, probe)
+# (b) only those who got to Courmayeur; outcome = dropped out AFTER Courmayeur
+pb_d <- probe |> filter(reached_cour) |> mutate(late_dnf = dnf)
+pb <- glm(late_dnf ~ opz_voza, binomial, pb_d)
+orp <- function(m, v = "opz_voza") {
+  ci <- suppressMessages(confint(m))
+  sprintf("%.2f (95%% CI %.2f–%.2f)", exp(coef(m)[[v]]), exp(ci[v,1]), exp(ci[v,2]))
+}
+n_late <- sum(pb_d$late_dnf)
+```
+
+Restricting to the `r nrow(pb_d)` runners in the 700–800 band who **reached Courmayeur (`r round(eds[["2026"]]$km_cour)` km)** — that is, throwing away everyone who cracked early — a hot start at 14 km still predicts dropping out later: OR **`r orp(pb)`** per standard deviation, against **`r orp(pa)`** across the whole band. The penalty is not an artefact of runners who were already failing at the first timing point; it is still there among those who got half way round.
+
+This does not settle causation — nothing here is randomised, and a slow-for-ability start can itself be an early symptom rather than a choice. But it does rule out the simplest version of the objection.
+
+# Summary
+
+- **Index < 600 (`r gb("Index <600","n")` runners, `r percent(gb("Index <600","rate"),1)` DNF).** A faster start lowers the DNF rate at every step (`r percent(gt(tt_voza,"Index <600","Conservative"),1)` → `r percent(gt(tt_voza,"Index <600","Fast (for ability)"),1)`); it signals an under-rated runner and banks cut-off margin. **This replicates in all three editions.**
+- **Index 600–700 (`r gb("Index 600–700","n")`, `r percent(gb("Index 600–700","rate"),1)` DNF).** The crossover zone — no clear effect in either direction.
+- **Index 700–800 (`r gb("Index 700–800","n")`, `r percent(gb("Index 700–800","rate"),1)` DNF).** In 2026 a fast start clearly raises DNF risk (OR `r sprintf('%.2f', gr2("2026","or78"))`), and the effect survives dropping everyone who cracked before Courmayeur. **But it does not show up in 2024 (OR `r sprintf('%.2f', gr2("2024","or78"))`) or 2025 (OR `r sprintf('%.2f', gr2("2025","or78"))`)**, so treat the size of it as a 2026 result, not a law.
+- **Index 800+ (`r gb("Index 800+","n")`, `r percent(gb("Index 800+","rate"),1)` DNF).** Highest failure rate, all voluntary abandons. Too few runners to say anything about pacing.
+
+Two findings, of very different strength.
+
+The **robust** one is that a fast start is *not* generally dangerous — for most of the field it is a good sign. Across three editions and roughly 7,000 starters, going out ahead of your rating significantly *lowers* the odds of dropping out for anyone rated below about 600, which is the majority of the race. The blanket version of the folklore is simply wrong, and it is wrong for most of the people who repeat it.
+
+The **suggestive** one is the half that matches the lore. The effect does reverse as ability rises — that reversal is highly significant in each edition separately — and at the top end the odds ratio sits above 1 in all three years. But it is only sharp enough to call in 2026, in the 700–800 band. On the evidence here a strong runner going out hard is a reasonable thing to worry about, and not something to state as established.
+
+# Method and limitations
+
+- **Data.** `R/scrape_all_runners.R` (2026) and `R/scrape_history.R` (2024, 2025) → `runners_all_utmb*.csv`, `passings_all_utmb*.csv`. Of `r comma(n_raw)` bibs returned for 2026, `r comma(n_field)` are used: starters with both a recorded outcome (finisher or DNF) and a UTMB Index. The remainder are non-starters, other statuses, or runners with no index. Per-runner derived values in `data/processed/pacing_blowup_utmb.csv`.
+- **Checkpoints across editions.** The `pointId` scheme is *not* shared between editions, and no endpoint maps a pointId to a place. `derive_checkpoints()` in `R/checkpoints.R` rebuilds each edition's distance table from the passings themselves (section speed × section split, median across runners); it reproduces the hand-read 2026 table to within 0.1 km. Anchors are then picked by distance, so the same points on the course are compared across years.
+- **Overpace** = −residual of elapsed time at the checkpoint on the UTMB Index, fitted with a natural spline (4 df) over every runner reaching that checkpoint. The spline matters: a straight-line fit leaves real index structure in the residual (within the 800+ band the linear residual still correlates −0.48 with the index; with the spline it is −0.03), which would make "fast start" partly a proxy for "lower-rated within the band".
+- **The primary reading is Col de Voza (`r km_voza` km)**, the first timing point, chosen because it is the earliest available measure of intent. Les Contamines is reported alongside as a check, not as a competing test.
+- **The headline test** is a single likelihood-ratio test of whether the overpace effect varies with ability, on the whole field at once (χ² = `r round(lrt_chi,1)`, `r lrt_df` df). The per-band models are descriptive; with only `r gb("Index 700–800","n")` runners in the 700–800 band, no single band-level test carries much weight on its own, which is why the cross-edition replication is the load-bearing evidence.
+- **Distance at DNF** uses `last_point_id`, the last checkpoint at which a runner was *timed*. A runner who is seen but not timed is attributed to the previous point, so these distances are mildly conservative.
+- **Replication.** 2024 and 2025 are re-analysed with the identical pipeline. The first timing point sits at `r round(eds[["2024"]]$km_voza,1)` km in 2024 and `r round(eds[["2025"]]$km_voza,1)` km in 2025 against `r km_voza` km in 2026 — close but not identical, which is harmless here because overpace is residualised within each edition, but it does mean the three "off the gun" readings are not taken at exactly the same spot.
+- **What replicated and what did not.** The reversal, and the protective effect on weaker runners, reproduce in all three editions. The magnitude of the penalty in the 700–800 band does not: it is clear in 2026 and absent in 2024–25. The article reports both.
+- **Associational.** No randomisation of pacing. Reverse causation is probed (above) but not eliminated. The Index is a noisy ability proxy, so some genuine ability signal survives inside "overpace" even after the spline.

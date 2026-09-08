@@ -1,0 +1,8 @@
+.DS_Store
+.Rhistory
+.Rproj.user/
+Rplots.pdf
+.claude/settings.local.json
+
+# Raw scraped API responses: reproducible via R/scrape_*.R, not source of truth
+data/raw/

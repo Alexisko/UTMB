@@ -1,0 +1,258 @@
+/*-- scss:defaults --*/
+// Financial Times–inspired Quarto theme.
+// Salmon paper, serif headlines, humanist-sans furniture.
+
+@import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,wght@0,400;0,600;0,700;1,400&family=Inter:wght@400;500;600;700&display=swap');
+
+$ft-paper:    #F4F1E9;
+$ft-paper-2:  #ECE7DB;
+$ft-ink:      #21201C;
+$ft-ink-2:    #6B655C;
+$ft-rule:     #E1DBCE;
+$ft-rule-2:   #D6CFBF;
+$ft-accent:   #1F5A73;  // petrol blue — primary accent (links, kicker, rules)
+$ft-claret:   $ft-accent;
+$ft-blue:     #1F5A73;
+$ft-teal:     #2C8375;
+
+$font-family-serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+$font-family-sans-serif: "Inter", -apple-system, "Helvetica Neue", Arial, sans-serif;
+
+// Body of an FT longread is serif on salmon.
+$font-family-base:  $font-family-serif;
+$headings-font-family: $font-family-serif;
+$font-size-root: 18px;
+$body-bg:    $ft-paper;
+$body-color: $ft-ink;
+
+$link-color: $ft-claret;
+$link-hover-color: darken($ft-claret, 8%);
+
+$toc-color: $ft-ink-2;
+$toc-active-border: $ft-claret;
+
+$table-border-color: $ft-rule-2;
+
+/*-- scss:rules --*/
+
+:root {
+  --ft-paper: #{$ft-paper};
+  --ft-paper-2: #{$ft-paper-2};
+  --ft-ink: #{$ft-ink};
+  --ft-ink-2: #{$ft-ink-2};
+  --ft-rule: #{$ft-rule};
+  --ft-rule-2: #{$ft-rule-2};
+  --ft-claret: #{$ft-claret};
+  --ft-blue: #{$ft-blue};
+  --ft-teal: #{$ft-teal};
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  line-height: 1.62;
+}
+
+// --- Reading column ---------------------------------------------------------
+// A narrow measure like a print feature; charts and tables may break wider.
+main.content {
+  max-width: 720px;
+  padding-top: 0.5rem;
+}
+.page-columns { --mermaid-max-width: 720px; }
+
+// One uniform body size everywhere (no enlarged intro paragraph).
+p, li { font-size: 1rem; }
+
+// --- Title block ------------------------------------------------------------
+#title-block-header.quarto-title-block {
+  margin-bottom: 2.4rem;
+  border-bottom: 1px solid $ft-rule-2;
+  padding-bottom: 1.4rem;
+}
+.quarto-title .title {
+  font-weight: 700;
+  font-size: clamp(2.1rem, 5vw, 3.1rem);
+  line-height: 1.06;
+  letter-spacing: -0.012em;
+  margin-bottom: 0.5rem;
+}
+// A "kicker" rule above the headline.
+#title-block-header.quarto-title-block::before {
+  content: "UTMB MONT-BLANC 2026";
+  display: block;
+  font-family: $font-family-sans-serif;
+  font-weight: 600;
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: $ft-claret;
+  margin-bottom: 0.9rem;
+}
+.quarto-title .subtitle {
+  font-family: $font-family-serif;
+  font-weight: 400;
+  font-size: 1.2rem;
+  line-height: 1.45;
+  color: $ft-ink-2;
+  margin-top: 0.2rem;
+  margin-bottom: 0;
+}
+.quarto-title-meta {
+  font-family: $font-family-sans-serif;
+  font-size: 0.82rem;
+  color: $ft-ink-2;
+  margin-top: 1.3rem;
+}
+.quarto-title-meta-heading {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  font-size: 0.68rem;
+}
+
+// --- Headings ---------------------------------------------------------------
+h1, h2, h3, h4 { color: $ft-ink; letter-spacing: -0.006em; }
+h2 {
+  font-weight: 700;
+  font-size: 1.62rem;
+  margin-top: 2.6rem;
+  padding-top: 1.1rem;
+  border-top: 2px solid $ft-ink;
+  line-height: 1.14;
+}
+h3 {
+  font-weight: 600;
+  font-size: 1.22rem;
+  margin-top: 1.9rem;
+  color: $ft-ink;
+}
+h4 {
+  font-family: $font-family-sans-serif;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: $ft-ink-2;
+  margin-top: 1.6rem;
+}
+
+// --- Standfirst / pull-quote (blockquote) ----------------------------------
+blockquote, .blockquote {
+  border-left: 3px solid $ft-accent;
+  background: transparent;
+  margin: 1.8rem 0;
+  padding: 0.2rem 0 0.2rem 1.3rem;
+  color: $ft-ink;
+  font-family: $font-family-serif;
+  font-size: 1.05rem;
+  font-style: normal;
+  line-height: 1.55;
+}
+blockquote p { font-size: inherit; }
+blockquote strong { color: $ft-claret; }
+
+// --- Figures & captions -----------------------------------------------------
+figure.quarto-float, .cell-output-display { margin: 1.8rem 0 1.4rem; }
+figure img, .cell-output-display img, .cell-output-display > .html-widget-static-bound {
+  background: $ft-paper;
+}
+figure.quarto-float figcaption, .figure-caption, .quarto-figure figcaption {
+  font-family: $font-family-sans-serif;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  color: $ft-ink-2;
+  border-top: 1px solid $ft-rule-2;
+  padding-top: 0.5rem;
+  margin-top: 0.4rem;
+}
+figure.quarto-float figcaption::before {
+  content: "";
+}
+// Let charts run a little wider than the text column.
+.quarto-figure, .cell-output-display, .quarto-float {
+  max-width: 820px;
+}
+
+// --- Tables (FT data-table look) -------------------------------------------
+table.table, .cell-output-display table {
+  font-family: $font-family-sans-serif;
+  font-size: 0.86rem;
+  font-variant-numeric: tabular-nums;
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1.4rem 0;
+}
+table.table thead th, .cell-output-display table thead th {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.72rem;
+  color: $ft-ink-2;
+  border-bottom: 1.5px solid $ft-ink;
+  border-top: none;
+  padding: 0.5rem 0.7rem;
+  text-align: right;
+}
+table.table thead th:first-child, .cell-output-display table thead th:first-child { text-align: left; }
+table.table tbody td, .cell-output-display table tbody td {
+  border-top: 1px solid $ft-rule-2;
+  padding: 0.42rem 0.7rem;
+  text-align: right;
+  color: $ft-ink;
+}
+table.table tbody td:first-child, .cell-output-display table tbody td:first-child {
+  text-align: left;
+  font-weight: 500;
+}
+table.table tbody tr:hover td { background: $ft-paper-2; }
+caption, .table caption {
+  caption-side: bottom;
+  font-family: $font-family-sans-serif;
+  font-size: 0.78rem;
+  color: $ft-ink-2;
+  text-align: left;
+  padding-top: 0.5rem;
+}
+
+// --- TOC --------------------------------------------------------------------
+#TOC, .toc-active { font-family: $font-family-sans-serif; }
+nav[role="doc-toc"] > ul > li > a { font-weight: 600; }
+nav[role="doc-toc"] ul { font-size: 0.82rem; }
+nav[role="doc-toc"] a { color: $ft-ink-2; }
+nav[role="doc-toc"] a:hover,
+nav[role="doc-toc"] a.active { color: $ft-claret; }
+.sidebar nav[role="doc-toc"] ul > li > a.active {
+  border-left: 2px solid $ft-claret;
+}
+#toc-title { text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.72rem; font-weight: 700; }
+
+// --- Panel-tabset -----------------------------------------------------------
+.panel-tabset .nav-tabs {
+  border-bottom: 1px solid $ft-rule-2;
+}
+.panel-tabset .nav-link {
+  font-family: $font-family-sans-serif;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: $ft-ink-2;
+  border: none;
+}
+.panel-tabset .nav-link.active {
+  color: $ft-claret;
+  background: transparent;
+  border-bottom: 2px solid $ft-claret;
+}
+
+// --- Callout / method box ---------------------------------------------------
+hr {
+  border: none;
+  border-top: 1px solid $ft-rule-2;
+  margin: 2.2rem 0;
+}
+
+strong, b { font-weight: 600; }
+em { font-style: italic; }
+
+// Inline code and numbers
+code { color: $ft-claret; background: $ft-paper-2; font-size: 0.9em; padding: 0.05em 0.3em; border-radius: 2px; }

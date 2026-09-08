@@ -1,0 +1,818 @@
+---
+title: "UTMB Mont-Blanc 2026: a statistical review"
+subtitle: "How well the UTMB Index predicts finishing time, how much time runners spend stopped, and a checkpoint-level look at one finisher, Tangi Taton."
+author: "Alexis Konarski"
+date: today
+format:
+  html:
+    theme: ft.scss
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    number-sections: false
+    code-fold: false
+    fig-width: 9
+    fig-height: 6
+    fig-dpi: 160
+    embed-resources: true
+    df-print: kable
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+```{r setup}
+#| include: false
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(scales)
+library(ggrepel)
+library(stringr)
+library(knitr)
+library(ggtext)
+
+source("ft_style.R")
+knitr::opts_chunk$set(dev = "ragg_png", dpi = 160, echo = FALSE)
+theme_set(theme_ft())
+
+spotlight_name <- "Tangi TATON"
+spotlight_bib  <- 535L
+
+cause_levels <- c("Abandon", "Cut-off (hors délai)")
+cause_cols   <- c("Abandon" = ft_claret, "Cut-off (hors délai)" = ft_teal)
+
+fmt_hm <- function(min) {
+  h <- floor(min / 60); m <- round(min %% 60)
+  ifelse(h > 0, sprintf("%dh%02d", h, m), sprintf("%d min", m))
+}
+ord <- function(n) paste0(n, dplyr::case_when(
+  n %% 100 %in% 11:13 ~ "th", n %% 10 == 1 ~ "st",
+  n %% 10 == 2 ~ "nd", n %% 10 == 3 ~ "rd", .default = "th"))
+```
+
+```{r load}
+raw <- read_csv("../data/processed/runners_all_utmb.csv", show_col_types = FALSE)
+
+# Starters (finishers + DNF) with an index, plus derived seed & result position.
+starters <- raw |>
+  filter(outcome %in% c("Finisher", "DNF"), !is.na(utmb_index)) |>
+  mutate(
+    time_h    = race_time_seconds / 3600,
+    seed      = rank(-utmb_index, ties.method = "min"),
+    dnf_cause = case_when(status == "a" ~ "Abandon",
+                          status == "hd" ~ "Cut-off (hors délai)",
+                          .default = NA_character_) |> factor(levels = cause_levels)
+  ) |>
+  arrange(outcome != "Finisher",
+          if_else(outcome == "Finisher", race_time_seconds, NA_real_),
+          desc(last_point_id), desc(race_time_seconds)) |>
+  mutate(result_pos = row_number(), seed_delta = seed - result_pos)
+
+n_start <- nrow(starters)
+n_fin   <- sum(starters$outcome == "Finisher")
+n_dnf   <- sum(starters$outcome == "DNF")
+
+# Finisher-level frame (rest time + finishing position among finishers).
+finishers <- starters |>
+  filter(outcome == "Finisher", !is.na(total_rest_time_seconds)) |>
+  mutate(
+    rest_min    = total_rest_time_seconds / 60,
+    finish_h    = race_time_seconds / 3600,
+    rest_share  = total_rest_time_seconds / race_time_seconds,
+    finish_rank = rank(race_time_seconds, ties.method = "min"),
+    moving_s    = race_time_seconds - total_rest_time_seconds,
+    moving_rank = rank(moving_s, ties.method = "min")
+  )
+
+tr      <- finishers |> filter(fullname == spotlight_name)   # the spotlight runner
+tr_rank <- tr$finish_rank
+```
+
+The 2026 UTMB Mont-Blanc is a loop around Mont Blanc run from Chamonix across the Alps. Measured on the timing points used here it is **173.6 km and 9,700 m of climbing** (`R/checkpoints.R`, read off the live course profile); the race is advertised as 171 km / 10,000 m. This report covers `r n_start` starters who carried a UTMB Index — the sport's pre-race ability rating: **`r n_fin` finished** (`r round(100*n_fin/n_start)`%) and **`r n_dnf` did not**.
+
+It looks at three things: how well the UTMB Index predicts finishing time — and for whom it predicts best — how much time runners spend stopped at aid stations, where that time goes and whether it costs more than the clock it burns, and a checkpoint-level breakdown of one finisher, Tangi Taton, used throughout as a worked example. Pacing and DNF risk are the subject of a companion report, [*Fast starts and blow-ups at the 2026 UTMB*](blowup_pacing.html).
+
+```{r summary-table}
+starters |>
+  summarise(runners = n(),
+            finishers = sum(outcome == "Finisher"),
+            dnf = sum(outcome == "DNF"),
+            finish_rate = percent(mean(outcome == "Finisher"), 0.1),
+            median_index = median(utmb_index),
+            .by = sex) |>
+  arrange(desc(runners)) |>
+  kable(caption = "Starters, finish rate and median UTMB Index, by sex.")
+```
+
+# The UTMB Index and finishing time
+
+## The index predicts finishing time well
+
+Plotting each finisher's time against their starting UTMB Index gives a clear linear relationship: a higher index goes with a faster finish, at a steady rate.
+
+```{r}
+#| label: fig-reg-all
+#| fig-cap: "Finish time against UTMB Index, all finishers. Teal ran faster than predicted; terracotta ran slower."
+fit_all <- lm(time_h ~ utmb_index, data = finishers)
+reg_df  <- finishers |> mutate(.resid_min = resid(fit_all) * 60)
+spot    <- reg_df |> filter(fullname == spotlight_name)
+
+ggplot(reg_df, aes(utmb_index, time_h)) +
+  geom_point(aes(color = .resid_min), alpha = 0.6, size = 1.9) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
+              color = ft_ink, linewidth = 0.6, linetype = "dashed") +
+  scale_colour_ft_div(name = "vs predicted\n(min)", midpoint = 0) +
+  geom_point(data = spot, color = ft_ink, size = 3.2, shape = 21, stroke = 1.1) +
+  geom_text_repel(data = spot, aes(label = str_glue("{fullname}\nidx {utmb_index} · {race_time}")),
+                  fontface = "bold", size = 3.3, box.padding = 1.2, colour = ft_ink,
+                  min.segment.length = 0, nudge_x = 8, nudge_y = 1) +
+  labs(title = "Finish time versus UTMB Index",
+       subtitle = str_glue("All {n_fin} finishers · R² = {round(summary(fit_all)$r.squared, 2)}, ",
+                           "{round(coef(fit_all)[['utmb_index']] * 60, 1)} min per index point"),
+       x = "UTMB Index (higher = stronger)", y = "Finish time (hours)",
+       caption = ft_source())
+```
+
+## How predictable is a runner, and where? {#sec-calibration}
+
+A rating is only as useful as the error around it, and that error is not the same size for everyone. Reading it decile by decile turns the line above into something a runner can use: how many minutes either side of the prediction people of their standard actually land.
+
+```{r calib}
+calib <- finishers |>
+  mutate(decile   = ntile(utmb_index, 10),
+         resid_min = resid(fit_all) * 60) |>
+  summarise(runners = n(), idx_lo = min(utmb_index), idx_hi = max(utmb_index),
+            bias_min = mean(resid_min), sd_min = sd(resid_min),
+            mae_min = median(abs(resid_min)), .by = decile) |>
+  arrange(decile)
+sd_overall <- sd(resid(fit_all)) * 60
+worst <- calib |> slice_max(sd_min, n = 1)
+```
+
+```{r}
+#| label: fig-calibration
+#| fig-cap: "Error around the index prediction by UTMB-Index decile. Bars are the standard deviation of the residual; terracotta points are the average miss, positive meaning slower than predicted."
+ggplot(calib, aes(factor(decile), sd_min)) +
+  geom_col(fill = ft_blue, width = 0.7) +
+  geom_hline(yintercept = sd_overall, linetype = "dashed", colour = ft_ink) +
+  geom_hline(yintercept = 0, colour = ft_rule, linewidth = 0.4) +
+  geom_point(aes(y = bias_min), colour = ft_claret, size = 2.6) +
+  annotate("text", x = 0.6, y = sd_overall, hjust = 0, vjust = -0.5, size = 3,
+           colour = ft_ink, label = str_glue(" field average {round(sd_overall)} min")) +
+  annotate("text", x = 1, y = calib$bias_min[1], hjust = -0.15, vjust = 0.5, size = 3,
+           colour = ft_claret, fontface = "bold",
+           label = str_glue("{round(calib$bias_min[1])} min")) +
+  scale_x_discrete(labels = str_glue("{calib$idx_lo}–{calib$idx_hi}")) +
+  scale_y_continuous(expand = expansion(0.06)) +
+  labs(title = "The index is most precise at the extremes",
+       subtitle = "Spread of the error (bars) and average miss (points) around the index prediction, by decile",
+       x = "UTMB Index decile", y = "Minutes", caption = ft_source()) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1, size = 8))
+```
+
+Across nine deciles out of ten the index lands in the right place — the average miss is under half an hour, in both directions. What changes is the width of the error. It is narrowest at the two ends, **`r round(calib$sd_min[10])` minutes** in the top decile (index `r calib$idx_lo[10]`+) and **`r round(calib$sd_min[1])` minutes** in the bottom one, and half again as wide in the middle: among runners rated `r worst$idx_lo`–`r worst$idx_hi`, half finish more than **`r fmt_hm(worst$mae_min)`** away from what their rating says.
+
+The two ends are precise for opposite reasons. The elite race to their rating — they arrive fit, they know the course, and a `r calib$idx_lo[10]`-plus index is itself the residue of several recent races run flat out. At the back it is the course that does the work: the cut-offs cap how slow a finish can be, and the wall shows up in the one decile where the index is genuinely off. Runners rated `r calib$idx_lo[1]`–`r calib$idx_hi[1]` beat their prediction by an average of **`r fmt_hm(abs(calib$bias_min[1]))`**, not because the rating underestimates them but because the ones it had right are not in this chart — they were timed out. Between the two, in the fat middle of the field, the index says roughly what to expect and the day says the rest.
+
+## Who does not finish
+
+The DNF rate varies with seed and splits into two causes: voluntary abandons and time cut-offs. Grouped into bands of 200 by seed, the DNF rate is highest among the strongest seeds, and in that band it is almost entirely voluntary abandons.
+
+```{r}
+#| label: fig-dnf-band
+#| fig-cap: "DNF rate by seed band, split into voluntary abandons and time cut-offs. The x-axis labels carry each band's UTMB Index range; the number above each bar is the total DNF rate."
+band_df <- starters |>
+  mutate(band_i = ((seed - 1) %/% 200) + 1) |>
+  summarise(n = n(), abandon = sum(status == "a"), cutoff = sum(status == "hd"),
+            idx_min = min(utmb_index), idx_max = max(utmb_index), .by = band_i) |>
+  arrange(band_i) |>
+  mutate(seed_lo = (band_i - 1) * 200 + 1, seed_hi = pmin(band_i * 200, n_start),
+         dnf_rate = (abandon + cutoff) / n,
+         lab = str_glue("{seed_lo}–{seed_hi}  ·  idx {idx_min}–{idx_max}"),
+         lab = factor(lab, levels = lab))
+
+band_df |>
+  transmute(lab, dnf_rate, `Abandon` = abandon / n, `Cut-off (hors délai)` = cutoff / n) |>
+  pivot_longer(all_of(cause_levels), names_to = "cause", values_to = "rate") |>
+  mutate(cause = factor(cause, levels = cause_levels)) |>
+  ggplot(aes(lab, rate, fill = cause)) +
+  geom_col() +
+  geom_text(data = band_df, aes(lab, dnf_rate, label = percent(dnf_rate, 1)),
+            inherit.aes = FALSE, vjust = -0.4, size = 3, colour = ft_ink) +
+  scale_y_continuous(labels = percent_format(), expand = expansion(c(0, 0.12))) +
+  scale_fill_manual(values = cause_cols, name = "Cause", drop = FALSE) +
+  labs(title = "DNF rate by seed band and cause",
+       subtitle = "Voluntary abandons versus time cut-offs, share of each seed band",
+       x = "Seed band · UTMB Index range", y = "DNF rate", caption = ft_source()) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1, size = 8))
+```
+
+Time cut-offs occur only lower in the field, where runners are close to the barriers. At the front, no one is timed out; the strongest seeds drop out more often than the mid-pack, and when they do it is by choice. This band-by-band difference in DNF cause is examined in detail in the companion report on pacing.
+
+### Inside the top 250 seeds {.unnumbered}
+
+The front of the field repays a closer look, because the drop-out rate does not fall away gradually there — it steps. In bands of 50, the strongest 150 seeds behave like one population and the next hundred like another, and Tangi's band sits on the quieter side of the step.
+
+```{r}
+#| label: fig-dnf-top250
+#| fig-cap: "DNF rate in bands of 50 among the 250 strongest seeds, split by cause. Each band is labelled with its UTMB Index range; Tangi's band is outlined."
+tangi_seed <- starters$seed[starters$fullname == spotlight_name]
+
+top250 <- starters |>
+  filter(seed <= 250) |>
+  mutate(band_i = ((seed - 1) %/% 50) + 1) |>
+  summarise(n = n(), abandon = sum(status == "a"), cutoff = sum(status == "hd"),
+            idx_min = min(utmb_index), idx_max = max(utmb_index),
+            seed_lo = min(seed), seed_hi = max(seed), .by = band_i) |>
+  arrange(band_i) |>
+  mutate(dnf_rate = (abandon + cutoff) / n,
+         has_tangi = tangi_seed >= seed_lo & tangi_seed <= seed_hi,
+         lab = str_glue("{seed_lo}–{seed_hi}  ·  idx {idx_min}–{idx_max}"),
+         lab = factor(lab, levels = lab))
+
+top250 |>
+  transmute(lab, has_tangi, dnf_rate,
+            `Abandon` = abandon / n, `Cut-off (hors délai)` = cutoff / n) |>
+  pivot_longer(all_of(cause_levels), names_to = "cause", values_to = "rate") |>
+  mutate(cause = factor(cause, levels = cause_levels)) |>
+  ggplot(aes(lab, rate)) +
+  geom_col(aes(fill = cause)) +
+  geom_col(data = top250, aes(lab, dnf_rate, colour = has_tangi), inherit.aes = FALSE,
+           fill = NA, linewidth = 0.9, show.legend = FALSE) +
+  geom_text(data = top250, aes(lab, dnf_rate, label = percent(dnf_rate, 1)),
+            inherit.aes = FALSE, vjust = -0.5, size = 3.2, colour = ft_ink) +
+  annotate("text", x = which(top250$has_tangi), y = 0, vjust = -0.8, size = 2.9,
+           fontface = "bold", colour = ft_paper, label = "Tangi's band") +
+  scale_colour_manual(values = c(`FALSE` = NA, `TRUE` = ft_ink), na.value = NA) +
+  scale_fill_manual(values = cause_cols, name = "Cause", drop = FALSE) +
+  scale_y_continuous(labels = percent_format(), expand = expansion(c(0, 0.14))) +
+  labs(title = "DNF rate among the 250 strongest seeds",
+       subtitle = "Bands of 50 seeds · voluntary abandons versus time cut-offs",
+       x = "Seed band · UTMB Index range", y = "DNF rate", caption = ft_source()) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1, size = 8))
+```
+
+```{r top250-prose}
+#| results: asis
+hi3 <- top250 |> slice(1:3) |> summarise(r = sum(abandon + cutoff) / sum(n)) |> pull(r)
+lo2 <- top250 |> slice(4:5) |> summarise(r = sum(abandon + cutoff) / sum(n)) |> pull(r)
+cat(str_glue(
+  "Across seeds 1–150 the DNF rate is **{percent(hi3, 1)}**; across seeds 151–250 it is ",
+  "**{percent(lo2, 1)}**. Not one of those {sum(top250$abandon + top250$cutoff)} non-finishers ",
+  "was timed out — at this end of the field, stopping is a decision rather than a barrier."
+))
+```
+
+## Sex, age and the odds of finishing {#sec-sex-age}
+
+Ability is not the only thing that separates the finishers from the rest. Two other splits are visible in the field before the race even starts.
+
+```{r sex-age}
+age_lab <- c("20–34", "35–39", "40–44", "45–49", "50–54", "55–59", "60+")
+demo <- starters |>
+  mutate(sex_l = if_else(sex == "F", "Women", "Men"),
+         band  = str_sub(category, 1, -2),
+         band  = if_else(band %in% c("60-64", "65-69", "70-74", "75-79"), "60+",
+                         str_replace(band, "-", "–")),
+         band  = factor(band, levels = age_lab))
+
+cross <- demo |>
+  summarise(n = n(), rate = mean(outcome == "DNF"), .by = c(band, sex_l)) |>
+  arrange(band)
+
+# Does the sex gap survive the things that differ between the two fields?
+or_of <- function(f) {
+  m <- glm(f, binomial, demo); s <- coef(summary(m))["sex_lWomen", ]
+  list(or = exp(s[["Estimate"]]), p = s[["Pr(>|z|)"]])
+}
+or_raw <- or_of(I(outcome == "DNF") ~ sex_l)
+or_adj <- or_of(I(outcome == "DNF") ~ sex_l + utmb_index + band)
+
+age_m <- glm(I(outcome == "DNF") ~ utmb_index + band, binomial, filter(demo, sex_l == "Men"))
+age_or <- exp(coef(age_m))
+```
+
+```{r}
+cross |>
+  pivot_wider(names_from = sex_l, values_from = c(n, rate)) |>
+  transmute(`Age band` = band,
+            `Men` = n_Men, `Men DNF` = percent(rate_Men, 0.1),
+            `Women` = n_Women, `Women DNF` = percent(rate_Women, 0.1),
+            `Gap` = sprintf("%+.1f pt", 100 * (rate_Women - rate_Men))) |>
+  kable(caption = "Starters and DNF rate by age band and sex. The gap is women's DNF rate minus men's, in percentage points.",
+        align = "lrrrrr")
+```
+
+```{r}
+#| label: fig-sex-age
+#| fig-cap: "DNF rate by age band and sex; point size is the number of starters in the cell. The lines coincide for the under-35s, separate through the forties, and converge again from fifty onwards."
+ggplot(cross, aes(band, rate, colour = sex_l, group = sex_l)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(aes(size = n)) +
+  scale_size_area(max_size = 7, guide = "none") +
+  scale_colour_manual(values = c(Women = ft_claret, Men = ft_blue), name = NULL) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, NA),
+                     expand = expansion(c(0, 0.08))) +
+  labs(title = "Who does not make it back to Chamonix",
+       subtitle = "DNF rate by age band and sex · point size = starters in that cell",
+       x = NULL, y = "DNF rate", caption = ft_source()) +
+  theme(legend.position = "top")
+```
+
+Age does not wear runners down gradually: from twenty to fifty the DNF rate barely moves, and then it steps. Holding the index constant, men in the 55–59 band are **`r sprintf("%.1f×", age_or[["band55–59"]])`** as likely to stop as those aged 20–34, and men over sixty **`r sprintf("%.1f×", age_or[["band60+"]])`** as likely — `r percent(cross$rate[cross$band == "60+" & cross$sex_l == "Men"], 1)` of them did. The rating already knows they are slower; what it does not price is the risk of the night going wrong.
+
+The sex gap is smaller but it is not a composition effect. Women start with a slightly lower median index and a similar age profile, and **`r percent(mean(demo$outcome[demo$sex_l == "Women"] == "DNF"), 0.1)`** of them did not finish against **`r percent(mean(demo$outcome[demo$sex_l == "Men"] == "DNF"), 0.1)`** of men — odds **`r sprintf("%.2f×", or_raw$or)`** higher, and still **`r sprintf("%.2f×", or_adj$or)`** (p = `r sprintf("%.3f", or_adj$p)`) once index and age band are controlled for. Nor is it spread evenly: the two lines sit on top of each other for the under-35s and for everyone over fifty, and separate in between — in the 40–44 band, where women are the second-largest female cohort in the race, `r percent(cross$rate[cross$band == "40–44" & cross$sex_l == "Women"], 0.1)` of them stopped against `r percent(cross$rate[cross$band == "40–44" & cross$sex_l == "Men"], 0.1)` of the men. On `r comma(sum(demo$sex_l == "Women"))` female starters that is one edition's worth of evidence, and worth carrying to the other years rather than concluding here.
+
+## Worked example: Tangi Taton {#sec-tangi-perf}
+
+```{r tangi-perf}
+#| results: asis
+tp <- starters |> filter(fullname == spotlight_name)
+
+# Seed and finishing position among finishers only: the field-wide `result_pos`
+# puts every DNF below every finisher, so it flatters all of them equally.
+fin_only <- starters |>
+  filter(outcome == "Finisher") |>
+  mutate(seed_f = rank(-utmb_index, ties.method = "min"),
+         pos_f  = rank(race_time_seconds, ties.method = "min"),
+         delta_f = seed_f - pos_f)
+tf <- fin_only |> filter(fullname == spotlight_name)
+
+dnf_ahead    <- sum(starters$outcome == "DNF" & starters$seed < tp$seed)
+# Peers seeded around him among finishers: how each converted seed into position.
+peers <- fin_only |> filter(seed_f >= 150, seed_f <= 350) |> mutate(ratio = pos_f / seed_f)
+tg_ratio    <- tf$pos_f / tf$seed_f
+peer_pctile <- round(100 * mean(peers$ratio > tg_ratio))
+
+pred_h  <- predict(fit_all, newdata = tp)
+gap_min <- round((pred_h - tp$time_h) * 60)
+
+cat(str_glue(
+  "Tangi Taton (bib {tp$bib}, category {tp$category}) has a UTMB Index of **{tp$utmb_index}**, ",
+  "which seeds him **{ord(tp$seed)}** of the {comma(n_start)} starters — just outside the top 200. ",
+  "He finished **{ord(tp$result_pos)}** in {tp$race_time}.\n\n",
+  "That reads as {tp$seed_delta} places gained on his seeding — but {dnf_ahead} runners rated ",
+  "above him did not finish at all, so the arithmetic hands him more than he took. Among the ",
+  "{comma(n_fin)} who did finish, he was ",
+  "the **{ord(tf$seed_f)} strongest on paper and came {ord(tf$pos_f)}** — {abs(tf$delta_f)} places ",
+  "the wrong side of his rating, and a better conversion than {peer_pctile}% of the finishers ",
+  "seeded around him. A solid, unremarkable run for a runner of his standard.\n\n",
+  "On the clock it looks better than that. The index predicts {sprintf('%.1f', pred_h)} hours for ",
+  "his rating and he ran {sprintf('%.1f', tp$time_h)} — **{abs(gap_min)} minutes ",
+  "{ifelse(gap_min>=0,'faster','slower')}** than predicted, comfortably inside the ",
+  "{round(sd(resid(fit_all))*60)}-minute spread that surrounds any index prediction. He is the ",
+  "point marked in black on the chart above, and the sections that follow take his race apart: ",
+  "where his time went, and where it was made."
+))
+```
+
+# Rest time
+
+Runners stop during the race — at aid stations, to refuel, change kit, or rest. The timing system separates moving time from stopped time. Across the `r n_fin` finishers, the median total stopped time is **`r fmt_hm(median(finishers$rest_min))`**, about **`r percent(median(finishers$rest_share), 1)`** of total race time.
+
+```{r rest-overview}
+finishers |>
+  summarise(`median rest` = fmt_hm(median(rest_min)), `mean rest` = fmt_hm(mean(rest_min)),
+            `min` = fmt_hm(min(rest_min)), `max` = fmt_hm(max(rest_min)),
+            `median % of race` = percent(median(rest_share), 0.1)) |>
+  kable(caption = "Total stopped time across all finishers.")
+```
+
+## Rest time versus finish time
+
+```{r fit-rest}
+fitr <- lm(rest_min ~ finish_h, data = finishers)
+r2r  <- summary(fitr)$r.squared; br <- coef(fitr)[["finish_h"]]
+```
+
+Slower finishers rest more: about **`r round(br, 1)` extra minutes stopped per additional hour on course** (R² = `r round(r2r, 2)`). Rest time and finish time are correlated, but this is expected — stronger runners both rest less and finish faster. Whether the resting itself adds time, beyond being a marker of a slow day, is the next question.
+
+```{r}
+#| label: fig-rest-finish
+#| fig-cap: "Total rest against finish time; colour shows the UTMB Index."
+spotr <- finishers |> filter(fullname == spotlight_name)
+ggplot(finishers, aes(finish_h, rest_min)) +
+  geom_point(aes(color = utmb_index), alpha = 0.6, size = 1.7) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
+              color = ft_ink, linewidth = 0.6, linetype = "dashed") +
+  scale_colour_ft_seq(name = "UTMB\nIndex") +
+  geom_point(data = spotr, color = ft_ink, size = 3.2, shape = 21, stroke = 1.1) +
+  geom_text_repel(data = spotr, aes(label = str_glue("{fullname}\n{fmt_hm(rest_min)} rest")),
+                  fontface = "bold", size = 3.3, box.padding = 1.2, colour = ft_ink,
+                  min.segment.length = 0, nudge_x = -1.5, nudge_y = 60) +
+  labs(title = "Total rest time versus finish time",
+       subtitle = str_glue("R² = {round(r2r, 2)}"),
+       x = "Finish time (hours)", y = "Total rest time (minutes)", caption = ft_source())
+```
+
+## Rest time at equal ability {#sec-rest-controlled}
+
+```{r rest-controlled}
+res_rest   <- resid(lm(rest_min ~ utmb_index, finishers))
+res_finish <- resid(lm(finish_h ~ utmb_index, finishers))
+res_moving <- resid(lm(I(moving_s / 3600) ~ utmb_index, finishers))
+pr_finish  <- cor(res_rest, res_finish)
+pr_moving  <- cor(res_rest, res_moving)
+
+# Minutes of extra time per extra minute of rest, at equal index. On finish time the
+# coefficient necessarily includes the one minute rest adds by definition; on MOVING
+# time it does not, so the moving-time fit is the non-tautological version.
+rest_coef <- function(df) {
+  c(finish = coef(lm(finish_h ~ utmb_index + rest_min, df))[["rest_min"]] * 60,
+    moving = coef(lm(I(moving_s / 3600) ~ utmb_index + rest_min, df))[["rest_min"]] * 60)
+}
+rc_all <- rest_coef(finishers)
+cut_h  <- 42
+fast_sub <- finishers |> filter(finish_h < cut_h)
+rc_fast  <- rest_coef(fast_sub)
+pdat <- tibble(res_rest, res_finish)
+```
+
+A minute stopped costs a minute on the clock — that much is arithmetic. The question is whether it costs anything more, and it does. Take two runners of the same index and compare their **moving** time, the hours actually spent going forward: each extra minute of rest goes with **`r round(rc_all[["moving"]], 2)` extra minutes of movement** (partial correlation `r round(pr_moving, 2)`). Among the `r comma(nrow(fast_sub))` finishers who came home inside `r cut_h` hours it is **`r round(rc_fast[["moving"]], 2)` minutes**.
+
+So the aid-station chair is not a neutral trade of time for recovery. A runner who spends an hour more than their rating suggests loses that hour twice over: once at the tables, and again out on the course, at something like **`r fmt_hm(60 + 60 * rc_all[["moving"]])` of finish time per hour stopped**. That is an association, not a mechanism — a bad night produces both the long stop and the slow walk out of it — but the two travel together, and they add rather than cancel.
+
+```{r}
+#| label: fig-rest-partial
+#| fig-cap: "Rest against finish time, with the UTMB-Index effect removed from both axes. A positive slope means that, at equal rating, more rest goes with a slower finish."
+ggplot(pdat, aes(res_rest, res_finish)) +
+  geom_point(alpha = 0.5, size = 1.6, color = ft_blue) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
+              color = ft_ink, linetype = "dashed", linewidth = 0.6) +
+  labs(title = "Rest versus finish, adjusted for UTMB Index",
+       subtitle = str_glue("Both axes residualised on the UTMB Index · partial r = {round(pr_finish, 2)}"),
+       x = "Rest time vs index-expected (minutes)",
+       y = "Finish time vs index-expected (hours)", caption = ft_source())
+```
+
+The relationship holds within each index band, and is strongest among stronger runners, for whom stopping is more discretionary than survival-driven:
+
+```{r rest-band-tbl}
+finishers |>
+  mutate(band = cut(utmb_index, c(-Inf, 500, 600, 650, 700, 750, 800, Inf),
+                    labels = c("<500", "500–600", "600–650", "650–700",
+                               "700–750", "750–800", "800+"))) |>
+  filter(!is.na(band)) |>
+  summarise(runners = n(), `median rest` = fmt_hm(median(rest_min)),
+            `cor(rest, finish)` = round(cor(rest_min, finish_h), 2), .by = band) |>
+  arrange(band) |>
+  kable(caption = "Correlation of rest and finish time within UTMB-Index bands.")
+```
+
+## Rest time by finishing position {#sec-rest-position}
+
+```{r}
+#| label: fig-rest-250
+#| fig-cap: "Mean total rest per band of 250 finishers, fastest on the left."
+band_250 <- finishers |>
+  mutate(band = (finish_rank - 1) %/% 250) |>
+  summarise(lo = min(finish_rank), hi = max(finish_rank), mean_rest = mean(rest_min), .by = band) |>
+  arrange(band) |> mutate(lab = factor(str_glue("{lo}–{hi}"), levels = str_glue("{lo}–{hi}")))
+ggplot(band_250, aes(lab, mean_rest)) +
+  geom_col(fill = ft_blue) +
+  geom_text(aes(label = fmt_hm(mean_rest)), vjust = -0.4, size = 3.2, colour = ft_ink) +
+  scale_y_continuous(expand = expansion(c(0, 0.12))) +
+  labs(title = "Mean rest time by finishing band (250)",
+       subtitle = "Mean total stopped time per band of 250 finishers",
+       x = "Finishing position", y = "Mean total rest time (minutes)", caption = ft_source())
+```
+
+Rest rises across most of the field, peaking around positions 1250–1500, then falls for the last finishers, who are more likely constrained by the cut-offs than resting by choice. Within the top 250:
+
+```{r}
+#| label: fig-rest-50
+#| fig-cap: "Mean total rest per band of 50 finishers, within the top 250."
+band_50 <- finishers |> filter(finish_rank <= 250) |>
+  mutate(band = (finish_rank - 1) %/% 50) |>
+  summarise(lo = min(finish_rank), hi = max(finish_rank), mean_rest = mean(rest_min), .by = band) |>
+  arrange(band) |> mutate(lab = factor(str_glue("{lo}–{hi}"), levels = str_glue("{lo}–{hi}")))
+ggplot(band_50, aes(lab, mean_rest)) +
+  geom_col(fill = ft_blue) +
+  geom_text(aes(label = fmt_hm(mean_rest)), vjust = -0.4, size = 3.2, colour = ft_ink) +
+  scale_y_continuous(expand = expansion(c(0, 0.12))) +
+  labs(title = "Mean rest time in the top 250 (bands of 50)",
+       subtitle = "Mean total stopped time per band of 50 finishers",
+       x = "Finishing position (top 250)", y = "Mean total rest time (minutes)", caption = ft_source())
+```
+
+## Where the rest budget goes {#sec-rest-where}
+
+Those two and three-quarter hours are not spread evenly around the loop. The clock records every stop separately, so the total can be opened up station by station — and when it is, most of the race turns out to be irrelevant to it.
+
+```{r rest-stations}
+source("../R/checkpoints.R")   # point_id -> name, cum_km, cum_dplus, section km / D+
+pass <- read_csv("../data/processed/passings_all_utmb.csv", show_col_types = FALSE)
+
+rest_pts <- pass |>
+  filter(bib %in% finishers$bib, !is.na(rest_time_seconds), rest_time_seconds > 0) |>
+  left_join(utmb_checkpoints, by = join_by(point_id)) |>
+  mutate(stop_min = rest_time_seconds / 60)
+
+# Minutes per finisher, counting the runners who went straight through as zero.
+# Summed over the stations this returns the mean total rest exactly, so it reads
+# as a decomposition of the budget rather than a description of a typical stop.
+nb_bibs <- finishers$bib[abs(finishers$finish_rank - tr_rank) <= 15]
+
+stations <- rest_pts |>
+  summarise(stoppers = n(),
+            per_finisher = sum(stop_min) / nrow(finishers),
+            median_stop  = median(stop_min),
+            neighbours   = sum(stop_min[bib %in% nb_bibs]) / length(nb_bibs),
+            tangi        = sum(stop_min[bib == spotlight_bib]),
+            .by = c(point_id, name, cum_km)) |>
+  arrange(cum_km) |>
+  mutate(share = per_finisher / sum(per_finisher))
+
+main_stations <- stations |> filter(stoppers >= 100)
+top_stations  <- stations |> slice_max(share, n = 2)
+big4_share    <- stations |> slice_max(share, n = 4) |> summarise(s = sum(share)) |> pull(s)
+skipped       <- main_stations |> filter(tangi == 0) |> slice_max(per_finisher, n = 1)
+
+# The two timing points preceded by the biggest climbs, for the terrain contrast.
+hard <- main_stations |>
+  left_join(utmb_sections |> select(point_id, sec_dplus), by = join_by(point_id)) |>
+  slice_max(sec_dplus, n = 2)
+
+# Where Tangi's surplus over his finishing neighbours actually sits.
+surplus <- main_stations |> mutate(gap = tangi - neighbours) |> slice_max(gap, n = 2)
+late    <- surplus |> arrange(desc(cum_km))
+```
+
+```{r}
+#| label: fig-rest-stations
+#| fig-cap: "Minutes of rest per runner at each main timing point, counting runners who did not stop there as zero, so each series sums to that group's total rest. The field average is dragged up by runners who are out for 40 hours or more; Tangi's neighbours finished within 15 places of him."
+budget_levels <- c("All finishers", "His finishing neighbours", "Tangi")
+budget <- main_stations |>
+  mutate(lab = str_glue("{name} · {round(cum_km)} km"),
+         lab = factor(lab, levels = rev(lab))) |>
+  select(lab, share, `All finishers` = per_finisher,
+         `His finishing neighbours` = neighbours, Tangi = tangi) |>
+  pivot_longer(all_of(budget_levels), names_to = "who", values_to = "minutes") |>
+  mutate(who = factor(who, levels = budget_levels))
+
+ggplot(budget, aes(minutes, lab)) +
+  geom_line(aes(group = lab), colour = ft_grid, linewidth = 2.4) +
+  geom_point(aes(colour = who, size = who)) +
+  geom_text(data = \(d) summarise(d, x = max(minutes), share = first(share), .by = lab),
+            aes(x, lab, label = if_else(share < 0.005, "<1%", percent(share, 1))),
+            inherit.aes = FALSE, hjust = -0.4, size = 2.9, colour = ft_ink2) +
+  scale_colour_manual(values = c("All finishers" = ft_neutral,
+                                 "His finishing neighbours" = ft_blue,
+                                 "Tangi" = ft_ink), name = NULL) +
+  scale_size_manual(values = c("All finishers" = 3, "His finishing neighbours" = 2.6,
+                               "Tangi" = 3.4), guide = "none") +
+  scale_x_continuous(expand = expansion(c(0.02, 0.12))) +
+  labs(title = "Where the rest budget goes",
+       subtitle = "Minutes stopped per runner at each timing point · label = share of the field's budget",
+       x = "Minutes per runner", y = NULL, caption = ft_source()) +
+  theme(legend.position = "top")
+```
+
+Two stations decide the whole thing. **`r top_stations$name[1]`** (`r round(top_stations$cum_km[1])` km) and **`r top_stations$name[2]`** (`r round(top_stations$cum_km[2])` km) take `r percent(sum(top_stations$share), 1)` of every minute the field spends stopped, `r fmt_hm(top_stations$per_finisher[1])` and `r fmt_hm(top_stations$per_finisher[2])` per runner; add Vallorcine and Trient and four stops out of twenty-odd account for `r percent(big4_share, 1)`. What earns them is not the terrain. The two points that follow the course's biggest climbs — `r hard$name[1]` (+`r comma(hard$sec_dplus[1])` m) and `r hard$name[2]` (+`r comma(hard$sec_dplus[2])` m) — are worth `r round(hard$per_finisher[1], 1)` and `r round(hard$per_finisher[2], 1)` minutes each. Runners stop where the aid station is big enough to sit down in.
+
+### How Tangi spent his {.unnumbered}
+
+Against the whole field Tangi looks frugal, and against the runners he actually finished with he does not — the field average includes people who were on the course for another fifteen hours. His `r fmt_hm(tr$rest_min)` went into `r sum(main_stations$tangi > 0)` stops against his neighbours' `r fmt_hm(sum(main_stations$neighbours))`, and he skipped `r skipped$name[1]` entirely, where the average finisher spends `r round(skipped$per_finisher[1], 1)` minutes.
+
+The surplus is concentrated. Of the `r fmt_hm(sum(main_stations$tangi) - sum(main_stations$neighbours))` he spent above the group he finished among, **`r fmt_hm(sum(surplus$tangi) - sum(surplus$neighbours))` sits in two stops**: `r late$name[2]` at `r round(late$cum_km[2])` km and `r late$name[1]` at `r round(late$cum_km[1])` km. The late one is the striking one. With `r round(173.6 - late$cum_km[1])` km and a single climb left between him and Chamonix, he spent `r fmt_hm(late$tangi[1])` at `r late$name[1]` against `r fmt_hm(late$neighbours[1])` for the runners he would finish alongside — more than twice as long, at the point in the race where there is least left to save.
+
+### Does *when* you rest matter? {.unnumbered}
+
+Tangi's pattern raises the general question. Two runners can spend the same total and spend it in opposite halves of the race — one grazing steadily from Les Contamines onwards, the other running through the early stations and then sitting for forty minutes at Champex-Lac. Splitting each runner's own budget at Courmayeur (`r round(utmb_checkpoints$cum_km[utmb_checkpoints$point_id == 28])` km, just under halfway) separates the two habits.
+
+```{r rest-timing}
+rest_shape <- rest_pts |>
+  summarise(early_share = sum(stop_min[cum_km <= 81.3]) / sum(stop_min), .by = bib)
+
+shaped <- finishers |>
+  inner_join(rest_shape, by = join_by(bib)) |>
+  mutate(moving_h = moving_s / 3600,
+         third = cut(early_share, quantile(early_share, c(0, 1/3, 2/3, 1)),
+                     labels = c("Back-loaded", "Even", "Front-loaded"), include.lowest = TRUE))
+
+fit_shape <- lm(moving_h ~ utmb_index + rest_min + early_share, shaped)
+sh_coef   <- coef(fit_shape)[["early_share"]]
+sh_p      <- coef(summary(fit_shape))["early_share", "Pr(>|t|)"]
+iqr_gain  <- -sh_coef * diff(quantile(shaped$early_share, c(0.25, 0.75))) * 60
+
+shaped$resid_min <- resid(lm(moving_h ~ utmb_index + rest_min, shaped)) * 60
+third_tbl <- shaped |>
+  summarise(runners = n(), `median early share` = percent(median(early_share), 1),
+            `median total rest` = fmt_hm(median(rest_min)),
+            `moving time vs expected` = str_glue("{ifelse(mean(resid_min)>=0,'+','')}{round(mean(resid_min))} min"),
+            .by = third) |>
+  arrange(factor(third, c("Front-loaded", "Even", "Back-loaded")))
+tg_share <- shaped |> filter(fullname == spotlight_name)
+```
+
+```{r}
+kable(third_tbl, caption = "Finishers split into thirds by the share of their rest budget spent before Courmayeur. 'Moving time vs expected' is the mean residual after removing UTMB Index and total rest — so the three groups are compared at equal ability and equal total rest.")
+```
+
+It matters where the stops fall. At equal rating **and equal total rest**, the runners who spend early move faster: **`r round(iqr_gain)` minutes of moving time** across the interquartile range of early share (p `r ifelse(sh_p < 0.001, "< 0.001", sprintf("= %.3f", sh_p))`), and `r round(diff(range(shaped |> summarise(m = mean(resid_min), .by = third) |> pull(m))))` minutes between the extreme thirds — with the front-loaded third resting *less* in total, not more.
+
+The likeliest reading is that a back-loaded budget is more symptom than cause: a runner coming apart in the last quarter both slows down and sits down, at Champex-Lac or Vallorcine, and the two show up together. Read that way it is still useful. A rest budget spent early is what a race under control looks like; one spent late is what salvage looks like. Tangi's was `r percent(tg_share$early_share, 1)` early, marginally the front-loaded side of the median finisher, but his two longest stops — Courmayeur and Vallorcine — book-end the second half.
+
+## Tangi's rest time versus his neighbours {#sec-tangi-rest}
+
+```{r tangi-rest-calc}
+# His stop as a multiple of the median, over a range of neighbourhood widths, so
+# the comparison does not hang on one choice of window.
+win_ratio <- map_dbl(c(5, 10, 15, 25, 50, 100), \(w) {
+  d <- finishers |> filter(abs(finish_rank - tr$finish_rank) <= w)
+  tr$rest_min / median(d$rest_min)
+})
+
+window <- finishers |> filter(abs(finish_rank - tr$finish_rank) <= 15)
+w_med  <- median(window$rest_min)
+w_rank <- rank(-window$rest_min, ties.method = "min")[window$fullname == spotlight_name]
+shift  <- tr$finish_rank - tr$moving_rank
+```
+
+The people who finished around him are the natural comparison: same course, same weather, same night, same rough level of ability. Among the **`r nrow(window)` finishers within ±15 places** (positions `r min(window$finish_rank)`–`r max(window$finish_rank)`), Tangi stopped for **`r fmt_hm(tr$rest_min)`** against a group median of **`r fmt_hm(w_med)`** — the `r scales::ordinal(w_rank)` longest in the group, and between **`r sprintf("%.1f", min(win_ratio))`× and `r sprintf("%.1f", max(win_ratio))`× the median** of everyone finishing within 5 to 100 places of him.
+
+```{r}
+#| label: fig-tangi-neighbours
+#| fig-cap: "Total rest time of the finishers around Tangi (±15 places), ordered by rest rather than by finishing position. Tangi in dark; the dashed line is the group median."
+window |>
+  mutate(is_tangi = fullname == spotlight_name,
+         lbl = factor(str_glue("{ord(finish_rank)}"),
+                      levels = str_glue("{ord(finish_rank[order(rest_min)])}"))) |>
+  ggplot(aes(rest_min, lbl)) +
+  geom_segment(aes(x = 0, xend = rest_min, yend = lbl, colour = is_tangi),
+               linewidth = 0.4, show.legend = FALSE) +
+  geom_point(aes(colour = is_tangi, size = is_tangi), show.legend = FALSE) +
+  geom_vline(xintercept = w_med, linetype = "dashed", colour = ft_ink2) +
+  annotate("text", x = w_med, y = 1, label = str_glue(" median {fmt_hm(w_med)}"),
+           hjust = 0, vjust = 0.2, size = 3, colour = ft_ink2) +
+  scale_colour_manual(values = c(`FALSE` = ft_neutral, `TRUE` = ft_ink)) +
+  scale_size_manual(values = c(`FALSE` = 2, `TRUE` = 3.6)) +
+  scale_x_continuous(expand = expansion(c(0, 0.08))) +
+  labs(title = "Total rest time of Tangi's finishing neighbours",
+       subtitle = "Finishers within ±15 positions, ordered by total rest · Tangi highlighted",
+       x = "Total rest time (minutes)", y = "Finishing position", caption = ft_source()) +
+  theme(axis.text.y = element_text(size = 7))
+```
+
+### Ranking on moving time only {.unnumbered}
+
+Strip the stops out and rank every finisher on moving time alone, and Tangi goes from **`r ord(tr$finish_rank)` to `r ord(tr$moving_rank)` — `r shift` places**. Between the aid stations he ran with the runners `r shift` places up the road; his classification is that run plus `r fmt_hm(tr$rest_min - w_med)` more standing still than the people he finished among.
+
+Not that the `r fmt_hm(tr$rest_min - w_med)` was ever simply available to him — at equal rating, the runners who stop longest are also the ones moving more slowly in between. **`r ord(tr$moving_rank)` on moving time** is what the race says about his legs; `r ord(tr$finish_rank)` is what it says about his day.
+
+```{r}
+#| label: fig-rest-removed
+#| fig-cap: "Actual finishing position against moving-time position for Tangi's neighbours. Points below the diagonal would gain places if rest were removed."
+window |>
+  mutate(is_tangi = fullname == spotlight_name) |>
+  ggplot(aes(finish_rank, moving_rank)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = ft_ink2) +
+  geom_point(aes(color = is_tangi, size = is_tangi), show.legend = FALSE) +
+  ggrepel::geom_text_repel(data = \(d) filter(d, is_tangi),
+    aes(label = str_glue("Tangi: {ord(finish_rank)} to {ord(moving_rank)}")),
+    fontface = "bold", size = 3.4, box.padding = 1.2, min.segment.length = 0,
+    colour = ft_ink, nudge_y = -8) +
+  scale_color_manual(values = c(`FALSE` = ft_neutral, `TRUE` = ft_ink)) +
+  scale_size_manual(values = c(`FALSE` = 1.9, `TRUE` = 3.4)) +
+  labs(title = "Finishing position versus moving-time position",
+       subtitle = "Below the line = would gain places if rest were removed · above = would lose places",
+       x = "Actual finishing position", y = "Position on moving time only", caption = ft_source())
+```
+
+# Tangi Taton, checkpoint by checkpoint
+
+The stops account for where his time went. The splits account for the rest of it. Mapped onto the named aid stations, his race can be read two ways: as a position on the road, which is what a spectator sees, and as a rank on each section taken separately, which is what his legs were doing.
+
+```{r stage-data}
+fin_bibs <- finishers$bib
+
+# Section rank: for each timing point, rank finishers by their TRUE per-section
+# split (`split_time`, an hms). NB the `split_time_seconds` column is mislabelled —
+# it holds CUMULATIVE seconds (it equals race_time_seconds at the finish), not the
+# section split — so ranking on it would just reproduce on-course position.
+seg <- pass |>
+  filter(bib %in% fin_bibs, !is.na(split_time)) |>
+  mutate(seg_rank = rank(as.numeric(split_time), ties.method = "min"), seg_n = n(), .by = point_id)
+
+tangi_seg <- seg |> filter(bib == spotlight_bib) |>
+  select(point_id, seg_rank) |>
+  right_join(pass |> filter(bib == spotlight_bib) |> select(point_id, rank), by = join_by(point_id)) |>
+  left_join(utmb_sections, by = join_by(point_id)) |>
+  filter(!is.na(cum_km)) |>
+  arrange(cum_km)
+
+final_rank <- tp$result_pos
+
+# Opening-section (Col de Voza) standing among finishers, for the prose below.
+open_rank <- tangi_seg |> filter(sec_km > 0) |> arrange(cum_km) |> slice(1) |> pull(seg_rank)
+n_quicker <- open_rank - 1
+
+# The seven headline aid stations, for marking the course axis.
+major <- utmb_checkpoints |>
+  filter(point_id %in% c(10, 16, 28, 40, 51, 62, 200)) |>
+  mutate(short = c("Contamines", "Chapieux", "Courmayeur", "Arnouvaz",
+                   "Champex", "Vallorcine", "Chamonix"))
+```
+
+## Overall position through the race
+
+```{r}
+#| label: fig-stage-overall
+#| fig-cap: "Tangi's overall on-course position along the route; the seven main aid stations are marked. Lower is better."
+tangi_seg |> filter(!is.na(rank)) |>
+  ggplot(aes(cum_km, rank)) +
+  geom_vline(data = major, aes(xintercept = cum_km), color = ft_grid) +
+  geom_line(color = ft_blue, linewidth = 0.9) +
+  geom_point(color = ft_blue, size = 2) +
+  geom_text(data = \(d) d |> slice(c(1, n())),
+            aes(label = str_glue("{rank}th")), vjust = -0.9, size = 3.3,
+            fontface = "bold", colour = ft_ink) +
+  scale_y_reverse(breaks = pretty_breaks(6)) +
+  scale_x_continuous(breaks = major$cum_km,
+                     labels = str_glue("{major$short}\n{major$cum_km} km")) +
+  labs(title = "Tangi's overall position through the race",
+       subtitle = str_glue("From {ord(max(tangi_seg$rank, na.rm = TRUE))} early to {ord(final_rank)} at the finish"),
+       x = "Course (main aid stations marked)", y = "Overall position on course",
+       caption = ft_source()) +
+  theme(axis.text.x = element_text(size = 8))
+```
+
+This is a negative split, and an unusually clean one: Tangi starts well down the field and takes places on almost every section to the finish. The early figures flatter the effect a little — the line counts everyone still on course, including the runners ahead of him at Col de Voza who would not see Chamonix. Against finishers alone his opening section ranked `r ord(open_rank)`, which is the more demanding comparison and the one used next.
+
+## Rank on each section
+
+Each bar is his placing on that section alone, his split time ranked against every finisher, with the section's distance and elevation gain in the label. Bars left of the dashed line — his `r ord(final_rank)`-place finish — are sections he ran better than his result. Nearly all of them are. The exception is the first: `r ord(open_rank)` up Col de Voza, and about half of the `r n_quicker` finishers who climbed it faster than he did came in behind him.
+
+```{r}
+#| label: fig-stage-section
+#| fig-height: 8
+#| fig-cap: "Tangi's rank on each named section (split time versus all finishers). Bars left of the dashed line beat his final position."
+tangi_seg |>
+  filter(sec_km > 0) |>
+  mutate(lab = str_glue("{name}  ({sec_km} km · +{sec_dplus} m)")) |>
+  ggplot(aes(seg_rank, reorder(lab, -cum_km))) +
+  geom_col(aes(fill = seg_rank <= final_rank), show.legend = FALSE) +
+  geom_vline(xintercept = final_rank, linetype = "dashed", color = ft_ink) +
+  geom_label(aes(label = seg_rank, fill = seg_rank <= final_rank),
+             color = "white", fontface = "bold", size = 2.9,
+             linewidth = 0, label.r = unit(0.12, "lines"), hjust = 1.02,
+             show.legend = FALSE) +
+  scale_fill_manual(values = c(`FALSE` = ft_neutral, `TRUE` = ft_green)) +
+  scale_x_continuous(expand = expansion(c(0, 0.05))) +
+  labs(title = "Tangi's rank on each section",
+       subtitle = str_glue("Section rank among finishers (1 = fastest) · green = faster than his {ord(final_rank)}-place finish · dashed line = {ord(final_rank)}"),
+       x = "Section rank among finishers (1 = fastest)", y = NULL, caption = ft_source())
+```
+
+## The runners who passed him early
+
+```{r voza-group}
+#| results: asis
+voza_rank <- pass |> filter(point_id == 4, bib == spotlight_bib) |> pull(rank)
+ahead <- pass |>
+  filter(point_id == 4, !is.na(rank), rank < voza_rank) |>
+  inner_join(starters, by = join_by(bib))
+
+ahead_dnf <- sum(ahead$outcome == "DNF")
+cat(str_glue(
+  "His cautious start put a large, strong group in front of him. Of the **{nrow(ahead)} runners ",
+  "ahead of him at Col de Voza ({utmb_checkpoints$cum_km[utmb_checkpoints$point_id == 4]} km) ",
+  "who carried an index, {ahead_dnf} ({percent(ahead_dnf/nrow(ahead), 1)}) did not finish** — ",
+  "above the field's {percent(n_dnf/n_start, 1)} rate. They were also a much stronger group than ",
+  "the field: median UTMB Index **{median(ahead$utmb_index)}** against **{median(starters$utmb_index)}** ",
+  "overall. (Their DNFs were stronger still, at a median of {median(ahead$utmb_index[ahead$outcome == 'DNF'])}.)\n\n",
+  "Whether going out ahead of a runner like Tangi *causes* those abandons — a fast start for one's ",
+  "ability as a risk factor — is the subject of the companion report, ",
+  "[*Fast starts and blow-ups at the 2026 UTMB*](blowup_pacing.html), which tests it band by band ",
+  "and across three editions. The short answer there is that the blanket version of the folklore ",
+  "is wrong — for most of the field a fast start is a *good* sign — and that the penalty appears ",
+  "only among the strongest runners: clearly in 2026's 700–800 band, which happens to be Tangi's ",
+  "own and whose conservative end he ran, but not in 2024 or 2025."
+))
+```
+
+# Method notes {.unnumbered}
+
+Everything above is descriptive: the field was not randomised into resting more or starting slower, so these are associations between things that happened on the same night.
+
+**Data.** Scraped from the UTMB Live API (`R/scrape_all_runners.R`) into `data/processed/runners_all_utmb.csv` (one row per starter) and `passings_all_utmb.csv` (one row per starter × checkpoint). The population is the `r comma(n_start)` starters recorded as finishers or DNFs and carrying a UTMB Index; non-starters, other statuses and runners without an index are excluded. **DNF cause** comes from the `status` field (`a` = voluntary abandon, `hd` = cut-off).
+
+**Course.** 173.6 km and 9,700 m D+ are the cumulative figures attached to the timing points in `R/checkpoints.R`, read off the live runner-detail page; the API exposes only numeric `pointId`s. The advertised course figure is 171 km / 10,000 m.
+
+**Seed and result position.** *Seed* is the dense rank of the UTMB Index across all starters; *result position* ranks finishers by time, then DNFs by furthest checkpoint reached, then time on course. Every DNF therefore sorts below every finisher, and every finisher gains places against their seed — a median of +`r median(fin_only$seed_delta)`. Seed-to-result comparisons for an individual runner (@sec-tangi-perf) are recomputed among finishers only, where the two ranks describe the same population.
+
+**Predictability by index** (@sec-calibration) is read as residual spread in minutes rather than R². R² on a slice of the field depends on the spread of the predictor inside that slice, which narrows sharply among the top seeds, so it is not comparable across subsets; the standard deviation of the residual, in minutes, is. Errors are taken from the straight-line fit shown in @fig-reg-all. A natural spline on the index fits significantly better but adds only 1.2 percentage points of R², and it absorbs almost all of that gain in the bottom decile: outside the cut-off-affected tail the relationship is linear.
+
+**Sex and age** (@sec-sex-age). Age bands are the official race categories, with 60–64 and above pooled to keep the cells usable. The adjusted odds ratios come from a logistic model of DNF on sex, UTMB Index and age band over all `r comma(n_start)` starters; the age effects quoted are from the same model fitted to men alone, so they are not carrying the sex gap.
+
+**Rest and moving time** come from the timing system's moving-versus-stopped split (`total_rest_time_seconds`); the per-station stops used in @sec-rest-where (`rest_time_seconds`) sum to that total exactly for every finisher. The station figures are **minutes per runner in the group, counting anyone who did not stop there as zero**, so each series sums to that group's own total rest and can be read as a decomposition of it. Two other readings were considered and rejected. The **median length of an actual stop** answers a different question — what a stop there looks like — and misleads about the budget, because it ignores how many runners stop at all: `r skipped$name[1]` has a median stop of `r round(skipped$median_stop[1], 1)` minutes, longer than Trient's, but only `r percent(skipped$stoppers[1]/n_fin, 1)` of finishers stop there, so it takes `r percent(skipped$share[1], 1)` of the budget against Trient's `r percent(stations$share[stations$name == "Trient"], 1)`. Averaging **each runner's own percentage split** weights every runner equally rather than letting the heaviest resters dominate, which is a real advantage, but the shares are compositional — one long stop mechanically shrinks every other cell for that runner — and a runner with a 20-minute budget then counts as much as one with six hours. On this field the two agree closely (Courmayeur `r percent(stations$share[stations$point_id == 30], 1)` by minutes against 23% by average share), so the additive version is used and nothing turns on the choice. The effect of rest at equal ability is estimated on **moving** time rather than finish time: finish time contains the stop itself, so a finish-time coefficient is one minute larger by construction (`r round(rc_all[["finish"]], 2)` against `r round(rc_all[["moving"]], 2)`) whatever the underlying relationship. Where the index is controlled for, it is by partial correlation — both variables residualised on the index.
+
+**Cut-off censoring.** `r sum(finishers$finish_h > 44)` finishers came home within 2.5 hours of the 46h30 limit, and mean rest falls in the slowest bands (@sec-rest-position) as runners run out of margin to stop rather than choosing not to. Rest models are therefore refitted on the `r comma(nrow(fast_sub))` finishers inside `r cut_h` hours; the effect is larger there (`r round(rc_fast[["moving"]], 2)` against `r round(rc_all[["moving"]], 2)` minutes), so the headline figure is the conservative one.
+
+**Timing of rest** (@sec-rest-where) is measured as the share of a runner's own rest budget taken by Courmayeur (81 km), fitted as `moving time ~ index + total rest + early share`. The coefficient keeps its sign and significance when the model is restricted to finishers inside `r cut_h` hours and when sex is added.
+
+**Neighbour comparisons** (@sec-tangi-rest) use a ±15-place window; the multiple of the group median is reported across windows from ±5 to ±100 so that it does not depend on that choice. **Section rank** ranks each finisher's split on a segment against every finisher who recorded that segment, so DNFs never inflate it.
